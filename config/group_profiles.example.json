@@ -1,0 +1,20 @@
+{
+  "oc_group_1": {
+    "report_title": "课程作业1组・每日日报",
+    "report_members": ["A同学", "B同学"],
+    "member_aliases": {
+      "ou_member_a": "A同学",
+      "ou_member_b": "B同学"
+    },
+    "visible_name_aliases": {
+      "飞书用户1234AB": "A同学"
+    },
+    "excluded_member_ids": ["ou_non_member"],
+    "send_enabled": true,
+    "homework_reaction_enabled": true,
+    "base_sync_enabled": true,
+    "base_token": "your_base_token",
+    "base_table_id": "your_table_id",
+    "report_link": "https://example.feishu.cn/base/your_base_token"
+  }
+}

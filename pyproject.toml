@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "feishu-group-summary-bot"
+version = "0.2.0"
+description = "飞书群消息收集与 AI 每日总结机器人"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "APScheduler==3.11.3",
+  "httpx==0.28.1",
+  "lark-oapi==1.7.2",
+  "python-dotenv==1.1.1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest==8.4.2",
+  "ruff==0.12.12",
+]
+
+[project.scripts]
+feishu-group-summary = "daily_report_bot.main:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/daily_report_bot"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"

@@ -1,0 +1,2263 @@
+from __future__ import annotations
+
+import logging
+import hashlib
+import json
+import re
+from collections import Counter, defaultdict
+from datetime import date, datetime, time, timedelta
+from secrets import choice
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+from .config import Settings
+from .models import AttendanceRecord, IncomingMessage, StoredMessage, SummaryResult
+from .parser import decode_content, extract_merged_children
+from .store import LocalStore
+
+
+logger = logging.getLogger(__name__)
+
+
+_EXPLICIT_REVIEW_DATE = re.compile(
+    r"(?<!\d)(?:20\d{2}[年./-]\s*)?\d{1,2}\s*[月./-]\s*\d{1,2}(?:\s*日)?(?!\d)"
+    r"|(?<!\d)\d{4}(?!\d)"
+)
+_REVIEW_MARKER = re.compile(r"#\s*[^#\n]{0,24}?复盘(?:打卡|总结)?")
+_COMPLETION_STATUS = (
+    r"已完成补打卡|已完成补交|已完成补卡|补交打卡|"
+    r"已补打卡|补打卡|已补交|补交|已补卡|补卡|已完成|完成"
+)
+_DATED_COMPLETION_MARKER = re.compile(
+    rf"#\s*(?P<mmdd>\d{{4}})\s*日?\s*(?P<label>[^#\n]{{0,30}}?)"
+    rf"(?P<status>{_COMPLETION_STATUS})"
+    r"(?=$|[\s，。！!]|https?://)"
+)
+_NATURAL_DATED_COMPLETION_MARKER = re.compile(
+    r"#\s*(?P<month>\d{1,2})\s*月\s*(?P<day>\d{1,2})\s*日?\s*"
+    rf"(?P<label>[^#\n]{{0,30}}?)(?P<status>{_COMPLETION_STATUS})"
+    r"(?=$|[\s，。！!]|https?://)"
+)
+_DAY_HOMEWORK_MARKER = re.compile(r"#\s*作业\s+(?P<assignment>DAY\s*\d+)", re.IGNORECASE)
+_LATE_MARKER = re.compile(r"(?:#\s*)?补(?:交|卡|打卡)")
+_MENTION_ONLY_PREFIX = re.compile(r"^(?:@[\w\u4e00-\u9fff.\-·]+ *){0,2}$")
+_NON_HOMEWORK_LABELS = ("复盘", "迭代", "补交", "补卡")
+_LATE_TAG_WINDOW_MS = 10 * 60 * 1000
+_THREAD_HOMEWORK_TYPES = {"image", "file", "media"}
+_FIRST_DAY_HOMEWORK_REACTIONS = ("LOVE", "FISTBUMP", "LAUGH", "FINGERHEART")
+_SECOND_DAY_HOMEWORK_REACTIONS = ("WITTY", "TRICK", "Get", "HIGHFIVE", "PARTY")
+_MAKEUP_HOMEWORK_REACTIONS = ("THINKING", "OnIt", "WOW", "Get")
+_THREAD_ASSIGNMENT_LABEL = re.compile(r"(?P<label>第\s*\d+\s*次\s*作业)")
+_ASSIGNMENT_NUMBER = re.compile(r"第\s*(?P<number>\d+|[一二三四五六七八九十]+)\s*次(?:\s*作业)?")
+_THREAD_COMPLETION_TEXT = re.compile(r"^\s*(?:#\s*)?已完成\s*[.!！。]?\s*$")
+_WEB_LINK = re.compile(r"https?://\S+", re.IGNORECASE)
+_QUERY_FULL_DATE = re.compile(
+    r"(?<!\d)(?P<year>20\d{2})[年./-](?P<month>\d{1,2})[月./-](?P<day>\d{1,2})(?:日)?(?!\d)"
+)
+_QUERY_MONTH_DAY = re.compile(r"(?<!\d)(?P<month>\d{1,2})[月./-](?P<day>\d{1,2})(?:日)?(?!\d)")
+_QUERY_MMDD = re.compile(r"(?<!\d)(?P<month>0[1-9]|1[0-2])(?P<day>[0-3]\d)(?!\d)")
+_STATS_TOPIC = re.compile(r"作业|打卡|提交|没交|未交|完成|复盘|迭代")
+_MISSING_INTENT = re.compile(r"没交|未交|没完成|未完成|缺交|还差|还有谁")
+_COMPLETED_INTENT = re.compile(r"谁(?:已经|已)?(?:交了|完成)|已交(?:人员|名单)?|完成人员")
+_MAKEUP_DECLARATION = re.compile(r"补(?:打卡|交|卡)")
+_MAKEUP_QUERY_INTENT = re.compile(
+    r"谁|哪些|哪几|名单|人员|成员|情况|状态|统计|查询|查一下|"
+    r"多少|几人|为什么|怎么|如何|是否|能否|吗|么|[？?]"
+)
+_EXPLICIT_ASSIGNMENT_REFERENCE = re.compile(
+    r"第\s*(?:\d+|[一二三四五六七八九十]+)\s*次|今天|昨天|前天"
+    r"|(?<!\d)(?:20\d{2}[年./-]\s*)?\d{1,2}\s*[月./-]\s*\d{1,2}(?:\s*日)?(?!\d)"
+    r"|(?<!\d)(?:0[1-9]|1[0-2])[0-3]\d(?!\d)"
+)
+_HOMEWORK_EVIDENCE_DETAIL = re.compile(
+    r"成果链接|作品链接|作业链接|作业说明|技术作业|"
+    r"课程\s*[:：]|作品说明|交付成果"
+)
+_HOMEWORK_EVIDENCE_CONTEXT = re.compile(r"作业|打卡|作品|成果|课程")
+_MEMBER_HISTORY_INTENT = re.compile(
+    r"(?:全部|所有|历史).*(?:打卡|作业|复盘|记录|状态|情况)"
+    r"|(?:打卡|作业|复盘).*(?:全部|所有|历史)"
+)
+_ITERATION_MARKER = re.compile(r"#\s*迭代\s*(?P<label>DAY\s*\d+|\d{4})", re.IGNORECASE)
+_ITERATION_COMPLETE = re.compile(r"已迭代|迭代完成|已完成")
+_MENTION_NAME = re.compile(r"@([^\s，,。！!？?：:#]+)")
+_MANUAL_ATTENDANCE_STATUS = {
+    "不参与统计": "excluded",
+    "正常提交": "completed",
+    "已提交": "completed",
+    "补卡": "late",
+    "已补交": "late",
+    "未提交": "missing",
+}
+
+
+def _day_range_ms(day: date, tz: Any) -> Tuple[int, int]:
+    start = datetime.combine(day, time.min, tzinfo=tz)
+    end = start + timedelta(days=1)
+    return int(start.timestamp() * 1000), int(end.timestamp() * 1000)
+
+
+class GroupSummaryService:
+    def __init__(self, settings: Settings, api: Any, summarizer: Any, store: LocalStore):
+        self.settings = settings
+        self.api = api
+        self.summarizer = summarizer
+        self.store = store
+        self._name_cache: Dict[Tuple[str, str], str] = {}
+        self._bot_name = ""
+        self._bot_name_loaded = False
+        self._base_record_index: Dict[str, str] = {}
+        self._base_index_loaded = False
+
+    def _chat_allowed(self, chat_id: str) -> bool:
+        return not self.settings.chat_ids or chat_id in self.settings.chat_ids
+
+    def _is_excluded(self, open_id: str) -> bool:
+        return open_id in self.settings.excluded_member_ids
+
+    def _resolve_sender_name(self, chat_id: str, open_id: str) -> str:
+        alias = self.settings.member_aliases.get(open_id)
+        if alias:
+            return alias
+        key = (chat_id, open_id)
+        if key not in self._name_cache:
+            try:
+                self._name_cache[key] = self.api.get_member_name(chat_id, open_id)
+            except Exception:
+                logger.exception("获取群成员昵称失败，使用成员 ID 兜底：chat=%s", chat_id)
+                self._name_cache[key] = ""
+        return self._name_cache[key] or f"成员-{open_id[-6:]}"
+
+    def _message_text(self, message: IncomingMessage) -> str:
+        if message.message_type == "merge_forward":
+            try:
+                return extract_merged_children(self.api.get_message_items(message.message_id)).text
+            except Exception:
+                logger.exception("展开合并转发失败：%s", message.message_id)
+                return "[合并转发消息]"
+        return decode_content(message.message_type, message.content).text
+
+    def _is_summary_command(self, text: str) -> bool:
+        compact = text.strip()
+        return any(
+            compact == command or compact.startswith(command + " ")
+            for command in self.settings.summary_commands
+        )
+
+    def _mentioned_query(self, text: str) -> Optional[str]:
+        if "@" not in text:
+            return None
+        if not self._bot_name_loaded:
+            self._bot_name_loaded = True
+            try:
+                self._bot_name = self.api.check_bot().strip()
+            except Exception:
+                logger.exception("获取机器人名称失败，暂不处理群内@问答")
+        if not self._bot_name:
+            return None
+        mention = re.compile(rf"@{re.escape(self._bot_name)}(?=$|[\s，,。！？!?：:])")
+        if not mention.search(text):
+            return None
+        return re.sub(r"\s+", " ", mention.sub("", text, count=1)).strip(" ，,。！？!?：:")
+
+    @staticmethod
+    def _parse_assignment_number(value: str) -> int:
+        if value.isdigit():
+            return int(value)
+        digits = {
+            "一": 1,
+            "二": 2,
+            "三": 3,
+            "四": 4,
+            "五": 5,
+            "六": 6,
+            "七": 7,
+            "八": 8,
+            "九": 9,
+        }
+        if value == "十":
+            return 10
+        if "十" in value:
+            tens_text, ones_text = value.split("十", 1)
+            tens = digits.get(tens_text, 1) if tens_text else 1
+            ones = digits.get(ones_text, 0) if ones_text else 0
+            return tens * 10 + ones
+        return digits.get(value, 0)
+
+    def _query_report_date(self, question: str, reference_day: date) -> str:
+        assignment_match = _ASSIGNMENT_NUMBER.search(question)
+        if assignment_match and self.settings.assignment_cycle_start_date:
+            assignment_number = self._parse_assignment_number(assignment_match.group("number"))
+            if assignment_number >= 1:
+                course_start = datetime.strptime(
+                    self.settings.assignment_cycle_start_date, "%Y-%m-%d"
+                ).date()
+                offset = (assignment_number - 1) * self.settings.assignment_cycle_days
+                return (course_start + timedelta(days=offset)).isoformat()
+        if "昨天" in question:
+            return (reference_day - timedelta(days=1)).isoformat()
+        if "前天" in question:
+            return (reference_day - timedelta(days=2)).isoformat()
+
+        match = _QUERY_FULL_DATE.search(question)
+        if match:
+            try:
+                return date(
+                    int(match.group("year")),
+                    int(match.group("month")),
+                    int(match.group("day")),
+                ).isoformat()
+            except ValueError:
+                return reference_day.isoformat()
+
+        match = _QUERY_MONTH_DAY.search(question) or _QUERY_MMDD.search(question)
+        if match:
+            try:
+                candidate = date(
+                    reference_day.year,
+                    int(match.group("month")),
+                    int(match.group("day")),
+                )
+                if candidate > reference_day + timedelta(days=31):
+                    candidate = date(
+                        reference_day.year - 1,
+                        candidate.month,
+                        candidate.day,
+                    )
+                return candidate.isoformat()
+            except ValueError:
+                return reference_day.isoformat()
+        return reference_day.isoformat()
+
+    def _named_messages(self, report_date: str, chat_id: str) -> List[StoredMessage]:
+        messages = self._load_messages(report_date, chat_id)
+        return self._apply_member_aliases(messages)
+
+    def _apply_member_aliases(self, messages: Sequence[StoredMessage]) -> List[StoredMessage]:
+        return [
+            message
+            if not (alias := self.settings.member_aliases.get(message.sender_open_id))
+            else StoredMessage(
+                message_id=message.message_id,
+                chat_id=message.chat_id,
+                sender_open_id=message.sender_open_id,
+                sender_name=alias,
+                message_type=message.message_type,
+                content=message.content,
+                create_time_ms=message.create_time_ms,
+                parent_id=message.parent_id,
+                root_id=message.root_id,
+                thread_id=message.thread_id,
+            )
+            for message in messages
+        ]
+
+    def _assignment_window_messages(
+        self,
+        report_date: str,
+        chat_id: str,
+        cutoff_hour: int,
+        cutoff_minute: int,
+    ) -> List[StoredMessage]:
+        cycle_start, due_day, _ = self.settings.assignment_cycle(report_date)
+        report_date = cycle_start.isoformat()
+        window_start_day = cycle_start
+        if not self.settings.assignment_cycle_start_date:
+            window_start_day -= timedelta(days=1)
+        start = datetime.combine(
+            window_start_day,
+            time(
+                self.settings.assignment_publish_hour,
+                self.settings.assignment_publish_minute,
+            ),
+            tzinfo=self.settings.tz,
+        )
+        end = datetime.combine(
+            due_day,
+            time(cutoff_hour, cutoff_minute),
+            tzinfo=self.settings.tz,
+        )
+        assignment_deadline = self.settings.assignment_deadline(report_date)
+        if assignment_deadline > end and (
+            cutoff_hour,
+            cutoff_minute,
+        ) == (
+            self.settings.assignment_due_hour,
+            self.settings.assignment_due_minute,
+        ):
+            end = assignment_deadline
+        else:
+            end = min(end, assignment_deadline)
+        messages = self.store.list_messages(
+            chat_id,
+            int(start.timestamp() * 1000),
+            int(end.timestamp() * 1000) + 1,
+            limit=self.settings.max_messages,
+        )
+        messages = [
+            message
+            for message in messages
+            if message.sender_open_id not in self.settings.excluded_member_ids
+        ]
+        thread_ids = {message.thread_id for message in messages if message.thread_id}
+        roots = self.store.thread_roots(chat_id, thread_ids)
+        filtered: List[StoredMessage] = []
+        for message in messages:
+            if not message.thread_id or message.thread_id not in roots:
+                filtered.append(message)
+                continue
+            root = roots[message.thread_id]
+            root_time = datetime.fromtimestamp(root.create_time_ms / 1000, tz=self.settings.tz)
+            thread_report_date = self.settings.assignment_report_date(root_time.date())
+            if thread_report_date == report_date:
+                filtered.append(message)
+        messages = filtered
+        return self._apply_member_aliases(messages)
+
+    def _post_deadline_messages(self, report_date: str, chat_id: str) -> List[StoredMessage]:
+        report_date = self.settings.assignment_report_date(report_date)
+        start_ms = int(self.settings.assignment_deadline(report_date).timestamp() * 1000) + 1
+        end_ms = int(datetime.now(tz=self.settings.tz).timestamp() * 1000) + 1
+        if start_ms >= end_ms:
+            return []
+        messages = self.store.list_messages(
+            chat_id, start_ms, end_ms, limit=self.settings.max_messages
+        )
+        messages = [
+            message
+            for message in messages
+            if message.sender_open_id not in self.settings.excluded_member_ids
+        ]
+        return self._apply_member_aliases(messages)
+
+    @staticmethod
+    def _normalize_iteration_label(value: str) -> str:
+        return re.sub(r"\s+", "", value).upper()
+
+    def _iteration_report_date(self, label: str, reference_day: date) -> str:
+        normalized = self._normalize_iteration_label(label)
+        if normalized.startswith("DAY"):
+            return reference_day.isoformat()
+        return self._query_report_date(normalized, reference_day)
+
+    def _record_iteration(self, text: str, message: StoredMessage) -> bool:
+        match = _ITERATION_MARKER.search(text)
+        if not match:
+            return False
+        label = self._normalize_iteration_label(match.group("label"))
+        completed = bool(_ITERATION_COMPLETE.search(text[match.end() :]))
+        mentions = [
+            name
+            for name in _MENTION_NAME.findall(text)
+            if name != self._bot_name and name in self.settings.report_members
+        ]
+        if completed:
+            target_name = mentions[0] if mentions else message.sender_name
+        elif mentions:
+            target_name = mentions[0]
+        else:
+            return False
+        if target_name not in self.settings.report_members:
+            return False
+        open_id_by_name = {name: open_id for open_id, name in self.settings.member_aliases.items()}
+        member_key = open_id_by_name.get(target_name, f"name:{target_name}")
+        event_day = datetime.fromtimestamp(
+            message.create_time_ms / 1000, tz=self.settings.tz
+        ).date()
+        report_date = self._iteration_report_date(label, event_day)
+        inserted = self.store.add_iteration_event(
+            message_id=message.message_id,
+            report_date=report_date,
+            assignment_label=label,
+            member_key=member_key,
+            member_name=target_name,
+            status="completed" if completed else "pending",
+            actor_open_id=message.sender_open_id,
+            actor_name=message.sender_name,
+            event_time_ms=message.create_time_ms,
+        )
+        if inserted:
+            logger.info("已记录迭代状态：%s %s %s", label, target_name, report_date)
+            self.sync_attendance_date(report_date, message.chat_id)
+        return True
+
+    def _answer_iteration_question(self, question: str) -> Optional[str]:
+        match = _ITERATION_MARKER.search(question)
+        if not match:
+            loose = re.search(r"(?<![A-Z0-9])(DAY\s*\d+)(?![A-Z0-9])", question, re.I)
+            if not loose:
+                return "请带上迭代批次，例如：@知识库助手 #迭代 DAY5 状态。"
+            label = self._normalize_iteration_label(loose.group(1))
+        else:
+            label = self._normalize_iteration_label(match.group("label"))
+        statuses = self.store.iteration_statuses(label)
+        pending = [name for name in self.settings.report_members if statuses.get(name) == "pending"]
+        completed = [
+            name for name in self.settings.report_members if statuses.get(name) == "completed"
+        ]
+        return (
+            f"{label} 迭代状态：\n"
+            f"待迭代（{len(pending)}人）：{self._names(pending)}\n"
+            f"已迭代（{len(completed)}人）：{self._names(completed)}"
+        )
+
+    def _answer_stats_question(
+        self, question: str, reference_day: date, chat_id: str
+    ) -> Optional[str]:
+        if not _STATS_TOPIC.search(question):
+            return None
+        if "迭代" in question:
+            return self._answer_iteration_question(question)
+        if _MEMBER_HISTORY_INTENT.search(question):
+            return self._answer_member_history(question, reference_day)
+        requested_date = self._query_report_date(question, reference_day)
+        report_date = self.settings.assignment_report_date(requested_date)
+        messages = self._named_messages(requested_date, chat_id)
+        homework_messages = self._assignment_window_messages(
+            report_date,
+            chat_id,
+            self.settings.assignment_due_hour,
+            self.settings.assignment_due_minute,
+        )
+        late_messages = self._post_deadline_messages(report_date, chat_id)
+        if not messages and not homework_messages and not late_messages:
+            day = datetime.strptime(report_date, "%Y-%m-%d").date()
+            return f"{day.month}月{day.day}日还没有收到可统计的群消息。"
+
+        facts = self._completion_facts(report_date, messages, homework_messages=homework_messages)
+        self._persist_attendance(report_date, homework_messages or late_messages or messages, facts)
+        roster = facts["roster"]
+        total = len(roster)
+        day_label = self._assignment_period_label(report_date)
+        wants_review = "复盘" in question
+        wants_homework = bool(re.search(r"作业|打卡|提交|没交|未交", question))
+        if wants_review and not wants_homework:
+            completed = facts["review_members"]
+            label = "复盘"
+        else:
+            completed = facts["homework_members"]
+            label = facts["assignment_label"]
+
+        completed_set = set(completed)
+        missing = [name for name in roster if name not in completed_set]
+        if not (wants_review and not wants_homework):
+            late = list(facts["late_members"])
+            late_set = set(late)
+            normal = [name for name in completed if name not in late_set]
+            if _COMPLETED_INTENT.search(question) and not _MISSING_INTENT.search(question):
+                return (
+                    f"{day_label}{label}已提交 {len(completed)}/{total}。\n"
+                    f"正常提交（{len(normal)}人）：{self._names(normal)}\n"
+                    f"已补交（{len(late)}人）：{self._names(late)}"
+                )
+            return (
+                f"{day_label}{label}已提交 {len(completed)}/{total}"
+                f"（正常提交 {len(normal)}，已补交 {len(late)}）。\n"
+                f"已补交（{len(late)}人）：{self._names(late)}\n"
+                f"仍未交（{len(missing)}人）：{self._names(missing)}"
+            )
+        if _COMPLETED_INTENT.search(question) and not _MISSING_INTENT.search(question):
+            return (
+                f"{day_label}{label}已完成 {len(completed)}/{total}。\n"
+                f"完成人员（{len(completed)}人）：{self._names(completed)}"
+            )
+        return (
+            f"{day_label}{label}已完成 {len(completed)}/{total}。\n"
+            f"未完成（{len(missing)}人）：{self._names(missing)}"
+        )
+
+    def _self_makeup_report_date(self, question: str, reference_day: date) -> Optional[str]:
+        if _EXPLICIT_ASSIGNMENT_REFERENCE.search(question):
+            requested = self._query_report_date(question, reference_day)
+            return self.settings.assignment_report_date(requested)
+        if self.settings.is_makeup_day(reference_day):
+            return self.settings.makeup_report_date(reference_day)
+        return None
+
+    @staticmethod
+    def _is_makeup_verification_request(question: str) -> bool:
+        """@机器人后的补交陈述默认归属于真实发送人；查询句仍走统计。"""
+        return bool(_MAKEUP_DECLARATION.search(question)) and not bool(
+            _MAKEUP_QUERY_INTENT.search(question)
+        )
+
+    def _message_targets_assignment(
+        self,
+        message: StoredMessage,
+        *,
+        report_date: str,
+        claim_message: StoredMessage,
+        next_assignment_publish_ms: int,
+        thread_root: Optional[StoredMessage],
+    ) -> bool:
+        message_day = datetime.fromtimestamp(
+            message.create_time_ms / 1000, tz=self.settings.tz
+        ).date()
+        explicit_dates = self._submission_report_dates(message.content, message_day)
+        if explicit_dates:
+            return report_date in explicit_dates
+
+        assignment_match = _ASSIGNMENT_NUMBER.search(message.content)
+        if assignment_match and self.settings.assignment_cycle_start_date:
+            assignment_number = self._parse_assignment_number(assignment_match.group("number"))
+            if assignment_number >= 1:
+                course_start = datetime.strptime(
+                    self.settings.assignment_cycle_start_date, "%Y-%m-%d"
+                ).date()
+                target = course_start + timedelta(
+                    days=(assignment_number - 1) * self.settings.assignment_cycle_days
+                )
+                return target.isoformat() == report_date
+
+        if thread_root is not None:
+            root_day = datetime.fromtimestamp(
+                thread_root.create_time_ms / 1000, tz=self.settings.tz
+            ).date()
+            root_dates = self._submission_report_dates(thread_root.content, root_day)
+            if root_dates:
+                return report_date in root_dates
+            root_assignment = _ASSIGNMENT_NUMBER.search(thread_root.content)
+            if root_assignment:
+                return self._query_report_date(root_assignment.group(0), root_day) == report_date
+            if self.settings.assignment_report_date(root_day) == report_date:
+                return True
+
+        if message.message_id == claim_message.message_id:
+            return True
+        if message.create_time_ms < next_assignment_publish_ms:
+            return True
+        return abs(message.create_time_ms - claim_message.create_time_ms) <= _LATE_TAG_WINDOW_MS
+
+    def _homework_evidence_kind(self, message: StoredMessage) -> str:
+        if message.message_type == "image" or "[图片]" in message.content:
+            return "作业图片"
+        if message.message_type in {"file", "media"} or "[文件]" in message.content:
+            return "作业文件"
+        if _WEB_LINK.search(message.content) and (
+            _HOMEWORK_EVIDENCE_CONTEXT.search(message.content)
+            or _HOMEWORK_EVIDENCE_DETAIL.search(message.content)
+        ):
+            return "作业链接"
+        if _HOMEWORK_EVIDENCE_DETAIL.search(message.content):
+            return "完整作业正文"
+        if self._is_thread_homework(message):
+            return "话题作业"
+        return ""
+
+    def _find_self_makeup_evidence(
+        self,
+        report_date: str,
+        claim_message: StoredMessage,
+    ) -> Tuple[List[StoredMessage], str]:
+        cycle_start, _, _ = self.settings.assignment_cycle(report_date)
+        start = datetime.combine(
+            cycle_start,
+            time(
+                self.settings.assignment_publish_hour,
+                self.settings.assignment_publish_minute,
+            ),
+            tzinfo=self.settings.tz,
+        )
+        deadline = self.settings.assignment_deadline(report_date)
+        makeup_end = deadline + timedelta(hours=24)
+        candidates = self.store.list_messages(
+            claim_message.chat_id,
+            int(start.timestamp() * 1000),
+            int(makeup_end.timestamp() * 1000) + 1,
+            self.settings.max_messages,
+        )
+        candidates = [
+            message
+            for message in candidates
+            if message.sender_open_id == claim_message.sender_open_id
+        ]
+        thread_ids = {message.thread_id for message in candidates if message.thread_id}
+        roots = self.store.thread_roots(claim_message.chat_id, thread_ids)
+        next_cycle_start = cycle_start + timedelta(days=self.settings.assignment_cycle_days)
+        next_publish = datetime.combine(
+            next_cycle_start,
+            time(
+                self.settings.assignment_publish_hour,
+                self.settings.assignment_publish_minute,
+            ),
+            tzinfo=self.settings.tz,
+        )
+        evidence: List[StoredMessage] = []
+        kinds: List[str] = []
+        for message in candidates:
+            kind = self._homework_evidence_kind(message)
+            if not kind:
+                continue
+            if not self._message_targets_assignment(
+                message,
+                report_date=report_date,
+                claim_message=claim_message,
+                next_assignment_publish_ms=int(next_publish.timestamp() * 1000),
+                thread_root=roots.get(message.thread_id),
+            ):
+                continue
+            evidence.append(message)
+            kinds.append(kind)
+        evidence.sort(key=lambda item: item.create_time_ms)
+        return evidence, "、".join(dict.fromkeys(kinds))
+
+    def _answer_self_makeup_verification(
+        self,
+        question: str,
+        reference_day: date,
+        message: StoredMessage,
+    ) -> str:
+        if message.sender_name not in self.settings.report_members:
+            return "你不在本群的打卡名单中，无法登记作业状态。"
+        report_date = self._self_makeup_report_date(question, reference_day)
+        if report_date is None:
+            return "请说明是第几次作业，例如：@知识库助手 补交第2次作业。"
+
+        evidence, evidence_kind = self._find_self_makeup_evidence(report_date, message)
+        _, _, assignment_number = self.settings.assignment_cycle(report_date)
+        if not evidence:
+            return (
+                f"已收到第{assignment_number}次作业的核验请求，但没有找到你本人的"
+                "作业链接、图片、文件或完整作业正文，当前状态没有修改。"
+                "请先发送作业内容，再@我核验。"
+            )
+
+        evidence_time_ms = evidence[0].create_time_ms
+        deadline = self.settings.assignment_deadline(report_date)
+        status = "completed" if evidence_time_ms <= int(deadline.timestamp() * 1000) else "late"
+        self.store.save_homework_verification(
+            report_date=report_date,
+            member_key=message.sender_open_id,
+            sender_open_id=message.sender_open_id,
+            sender_name=message.sender_name,
+            claim_message_id=message.message_id,
+            status=status,
+            evidence_message_ids=[item.message_id for item in evidence],
+            evidence_time_ms=evidence_time_ms,
+        )
+        self.sync_attendance_date(report_date, message.chat_id)
+
+        submitted_at = datetime.fromtimestamp(evidence_time_ms / 1000, tz=self.settings.tz)
+        result = "正常提交" if status == "completed" else "补卡"
+        timing_note = (
+            "按实际提交时间判定，即使消息中写了“补交”也不改为补卡"
+            if status == "completed"
+            else f"正常截止时间为{deadline.month}月{deadline.day}日 {deadline:%H:%M}"
+        )
+        sync_note = (
+            "数据库已刷新，多维表格已触发同步。"
+            if self.settings.base_sync_enabled
+            else "数据库已刷新。"
+        )
+        return (
+            f"已核验：{message.sender_name}于{submitted_at.month}月{submitted_at.day}日 "
+            f"{submitted_at:%H:%M}提交第{assignment_number}次作业。\n"
+            f"判定结果：{result}（{timing_note}）。\n"
+            f"核验依据：{evidence_kind}。{sync_note}"
+        )
+
+    def _assignment_period_label(self, report_date: str) -> str:
+        cycle_start, cycle_end, assignment_number = self.settings.assignment_cycle(report_date)
+        if cycle_start == cycle_end:
+            return f"{cycle_start.month}月{cycle_start.day}日"
+        return (
+            f"第{assignment_number}次作业（{cycle_start.month}月{cycle_start.day}日—"
+            f"{cycle_end.month}月{cycle_end.day}日）"
+        )
+
+    def _answer_member_history(self, question: str, reference_day: date) -> str:
+        member_name = next(
+            (
+                name
+                for name in sorted(self.settings.report_members, key=len, reverse=True)
+                if name != "，" and name in question
+            ),
+            "",
+        )
+        if not member_name:
+            return "没有找到要查询的成员，请使用群内昵称，例如：查询小李全部打卡记录。"
+
+        member_key = next(
+            (
+                open_id
+                for open_id, alias in self.settings.member_aliases.items()
+                if alias == member_name
+            ),
+            member_name,
+        )
+        records = self.store.list_member_attendance(
+            member_key, member_name, reference_day.isoformat()
+        )
+        records = [
+            record
+            for record in records
+            if record.report_date != reference_day.isoformat()
+            or record.homework_status != "missing"
+            or record.review_status != "missing"
+        ]
+        if not records:
+            return f"{member_name}还没有可查询的打卡记录。"
+
+        homework_labels = {
+            "completed": "✅ 正常打卡",
+            "late": "🟡 补卡",
+            "missing": "❌ 未打卡",
+        }
+        normal = sum(record.homework_status == "completed" for record in records)
+        late = sum(record.homework_status == "late" for record in records)
+        missing = sum(record.homework_status == "missing" for record in records)
+        reviewed = sum(record.review_status == "completed" for record in records)
+        first_day = datetime.strptime(records[0].report_date, "%Y-%m-%d").date()
+        last_day = datetime.strptime(records[-1].report_date, "%Y-%m-%d").date()
+        lines = [
+            f"{member_name}・全部打卡记录",
+            "",
+            f"统计范围：{first_day.month}月{first_day.day}日—{last_day.month}月{last_day.day}日",
+            f"累计：正常 {normal} 次｜补卡 {late} 次｜未打卡 {missing} 次｜复盘 {reviewed}/{len(records)}",
+            "",
+            "📋 逐次记录",
+            "",
+        ]
+        for record in records:
+            day = datetime.strptime(record.report_date, "%Y-%m-%d").date()
+            homework = homework_labels.get(record.homework_status, record.homework_status)
+            review = "✅ 已复盘" if record.review_status == "completed" else "❌ 未复盘"
+            lines.append(
+                f"{day.month}月{day.day}日（{record.assignment_label}）：{homework}｜{review}"
+            )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _valid_date_markers(day: date) -> set[str]:
+        return {
+            f"{day:%m%d}",
+            f"{day.month}{day.day:02d}",
+            f"{day.month}月{day.day}日",
+            f"{day.month}月{day.day}",
+            f"{day.month}/{day.day}",
+            f"{day.month}-{day.day}",
+            f"{day:%Y-%m-%d}",
+            f"{day.year}/{day.month}/{day.day}",
+            f"{day.year}年{day.month}月{day.day}日",
+        }
+
+    def _is_review_for_day(self, text: str, report_date: str) -> bool:
+        markers = list(_REVIEW_MARKER.finditer(text))
+        if not markers:
+            return False
+        day = datetime.strptime(report_date, "%Y-%m-%d").date()
+        valid_markers = self._valid_date_markers(day)
+        for marker in markers:
+            nearby = text[marker.start() : marker.end() + 24]
+            explicit_dates = _EXPLICIT_REVIEW_DATE.findall(nearby)
+            if not explicit_dates:
+                return True
+            compact = re.sub(r"\s+", "", nearby)
+            if any(value in compact for value in valid_markers):
+                return True
+        return False
+
+    @staticmethod
+    def _clean_assignment_label(value: str) -> str:
+        label = re.sub(r"\s+", "", value).strip("：:，,。！!")
+        return label or "作业"
+
+    def _completion_markers_for_day(self, text: str, report_date: str) -> List[Tuple[str, int]]:
+        report_date = self.settings.assignment_report_date(report_date)
+        day = datetime.strptime(report_date, "%Y-%m-%d").date()
+        markers: List[Tuple[str, int]] = []
+        for marker_day, label, position, _is_late in self._dated_completion_markers(text, day):
+            if self._marker_report_date(marker_day, label) != report_date:
+                continue
+            markers.append((label, position))
+        if not _LATE_MARKER.search(text):
+            for match in _DAY_HOMEWORK_MARKER.finditer(text):
+                assignment = re.sub(r"\s+", "", match.group("assignment")).upper()
+                markers.append((f"{assignment}作业", match.start()))
+        return markers
+
+    def _marker_report_date(self, marker_day: date, label: str) -> str:
+        """显式的「第 N 次作业」优先决定作业归属。
+
+        补卡日的日期标签往往写实际提交日，不能再用该日期反推
+        作业周期；没有作业序号时，仍保留原有按日期归属的规则。
+        """
+        match = _ASSIGNMENT_NUMBER.search(label)
+        if match and self.settings.assignment_cycle_start_date:
+            assignment_number = self._parse_assignment_number(match.group("number"))
+            if assignment_number >= 1:
+                course_start = datetime.strptime(
+                    self.settings.assignment_cycle_start_date, "%Y-%m-%d"
+                ).date()
+                offset = (assignment_number - 1) * self.settings.assignment_cycle_days
+                return (course_start + timedelta(days=offset)).isoformat()
+        return self.settings.assignment_report_date(marker_day)
+
+    def _dated_completion_markers(
+        self, text: str, reference_day: date
+    ) -> List[Tuple[date, str, int, bool]]:
+        markers: List[Tuple[date, str, int, bool]] = []
+        for match in _DATED_COMPLETION_MARKER.finditer(text):
+            mmdd = match.group("mmdd")
+            try:
+                candidate = date(reference_day.year, int(mmdd[:2]), int(mmdd[2:]))
+            except ValueError:
+                continue
+            if candidate > reference_day + timedelta(days=31):
+                candidate = date(reference_day.year - 1, candidate.month, candidate.day)
+            label = self._clean_assignment_label(match.group("label"))
+            if any(blocked in label for blocked in _NON_HOMEWORK_LABELS):
+                continue
+            markers.append(
+                (candidate, label, match.start(), bool(_LATE_MARKER.search(match.group("status"))))
+            )
+        for match in _NATURAL_DATED_COMPLETION_MARKER.finditer(text):
+            try:
+                candidate = date(
+                    reference_day.year,
+                    int(match.group("month")),
+                    int(match.group("day")),
+                )
+            except ValueError:
+                continue
+            if candidate > reference_day + timedelta(days=31):
+                candidate = date(reference_day.year - 1, candidate.month, candidate.day)
+            label = self._clean_assignment_label(match.group("label"))
+            if any(blocked in label for blocked in _NON_HOMEWORK_LABELS):
+                continue
+            markers.append(
+                (candidate, label, match.start(), bool(_LATE_MARKER.search(match.group("status"))))
+            )
+        return markers
+
+    def _submission_report_dates(self, text: str, reference_day: date) -> List[str]:
+        report_dates: set[str] = set()
+        for candidate, label, position, _is_late in self._dated_completion_markers(
+            text, reference_day
+        ):
+            if not self._is_submission_marker(text, position):
+                continue
+            report_dates.add(self._marker_report_date(candidate, label))
+        return sorted(report_dates)
+
+    @staticmethod
+    def _is_submission_marker(text: str, marker_start: int) -> bool:
+        prefix = text[:marker_start].strip()
+        prefix = _WEB_LINK.sub("", prefix).strip()
+        return bool(_MENTION_ONLY_PREFIX.fullmatch(prefix))
+
+    @staticmethod
+    def _late_image_message_ids(messages: Sequence[StoredMessage]) -> set[str]:
+        recent_images: Dict[str, List[StoredMessage]] = defaultdict(list)
+        late_message_ids: set[str] = set()
+        for message in messages:
+            if "[图片]" in message.content:
+                recent_images[message.sender_open_id].append(message)
+            if not _LATE_MARKER.search(message.content):
+                continue
+            for candidate in reversed(recent_images[message.sender_open_id]):
+                delta = message.create_time_ms - candidate.create_time_ms
+                if 0 <= delta <= _LATE_TAG_WINDOW_MS:
+                    late_message_ids.add(candidate.message_id)
+                    break
+        return late_message_ids
+
+    @staticmethod
+    def _is_thread_homework(message: StoredMessage) -> bool:
+        """话题中的附件、作品链接或明确完成回复算作业。"""
+        if not message.thread_id:
+            return False
+        return (
+            message.message_type in _THREAD_HOMEWORK_TYPES
+            or "[图片]" in message.content
+            or bool(_WEB_LINK.search(message.content))
+            or bool(_THREAD_COMPLETION_TEXT.fullmatch(message.content))
+        )
+
+    @staticmethod
+    def _thread_assignment_label(messages: Sequence[StoredMessage]) -> str:
+        labels: Counter[str] = Counter()
+        for message in messages:
+            if not message.thread_id:
+                continue
+            for match in _THREAD_ASSIGNMENT_LABEL.finditer(message.content):
+                labels[re.sub(r"\s+", "", match.group("label"))] += 1
+        return labels.most_common(1)[0][0] if labels else ""
+
+    def _completion_facts(
+        self,
+        report_date: str,
+        messages: Sequence[StoredMessage],
+        homework_messages: Optional[Sequence[StoredMessage]] = None,
+    ) -> Dict[str, Any]:
+        roster = list(self.settings.report_members)
+        roster_set = set(roster)
+        image_count = sum(message.content.count("[图片]") for message in messages)
+        homework_source_messages = (
+            list(messages) if homework_messages is None else list(homework_messages)
+        )
+        review_counts: Counter[str] = Counter()
+        review_evidence: Dict[str, List[str]] = defaultdict(list)
+        marker_labels: Counter[str] = Counter()
+        marker_evidence: Dict[str, Dict[str, List[str]]] = defaultdict(lambda: defaultdict(list))
+        thread_homework = [
+            message for message in homework_source_messages if self._is_thread_homework(message)
+        ]
+        thread_assignment_label = self._thread_assignment_label(homework_source_messages)
+        for message in messages:
+            if self._is_review_for_day(message.content, report_date):
+                review_counts[message.sender_name] += 1
+                review_evidence[message.sender_name].append(message.message_id)
+        for message in homework_source_messages:
+            for label, position in self._completion_markers_for_day(message.content, report_date):
+                marker_labels[label] += 1
+                if self._is_submission_marker(message.content, position):
+                    marker_evidence[message.sender_name][label].append(message.message_id)
+
+        homework_evidence: Dict[str, List[str]] = defaultdict(list)
+        if marker_labels:
+            assignment_label = marker_labels.most_common(1)[0][0]
+            homework_source = "tag+thread" if thread_homework else "tag"
+            for name, labels in marker_evidence.items():
+                homework_evidence[name].extend(labels.get(assignment_label, []))
+            for message in thread_homework:
+                homework_evidence[message.sender_name].append(message.message_id)
+        elif thread_homework:
+            assignment_label = thread_assignment_label or "话题作业"
+            homework_source = "thread"
+            for message in homework_source_messages:
+                if self._is_thread_homework(message) or "[图片]" in message.content:
+                    homework_evidence[message.sender_name].append(message.message_id)
+        else:
+            assignment_label = "图片作业"
+            homework_source = "image"
+            late_image_ids = self._late_image_message_ids(homework_source_messages)
+            for message in homework_source_messages:
+                if (
+                    "[图片]" in message.content
+                    and message.message_id not in late_image_ids
+                    and not message.parent_id
+                    and not message.root_id
+                ):
+                    homework_evidence[message.sender_name].append(message.message_id)
+
+        homework_members_set = {
+            name for name, evidence in homework_evidence.items() if evidence and name in roster_set
+        }
+        review_members_set = {
+            name for name, evidence in review_evidence.items() if evidence and name in roster_set
+        }
+        homework_members = [name for name in roster if name in homework_members_set]
+        review_members = [name for name in roster if name in review_members_set]
+        return {
+            "roster": roster,
+            "assignment_label": assignment_label,
+            "homework_source": homework_source,
+            "assignment_detected": bool(
+                marker_labels or thread_assignment_label or homework_evidence
+            ),
+            "image_count": image_count,
+            "homework_members": homework_members,
+            "late_members": [],
+            "review_members": review_members,
+            "review_counts": review_counts,
+            "homework_evidence": homework_evidence,
+            "review_evidence": review_evidence,
+            "both": [
+                name
+                for name in roster
+                if name in homework_members_set and name in review_members_set
+            ],
+            "only_homework": [
+                name
+                for name in roster
+                if name in homework_members_set and name not in review_members_set
+            ],
+            "only_reviews": [
+                name
+                for name in roster
+                if name not in homework_members_set and name in review_members_set
+            ],
+            "none": [
+                name
+                for name in roster
+                if name not in homework_members_set and name not in review_members_set
+            ],
+        }
+
+    def _apply_late_completions(
+        self, report_date: str, messages: Sequence[StoredMessage], facts: Dict[str, Any]
+    ) -> None:
+        report_date = self.settings.assignment_report_date(report_date)
+        if not messages:
+            return
+        start_ms = int(self.settings.assignment_deadline(report_date).timestamp() * 1000) + 1
+        late_stage_end = self.settings.assignment_deadline(report_date) + timedelta(hours=24)
+        end_ms = int(min(datetime.now(tz=self.settings.tz), late_stage_end).timestamp() * 1000) + 1
+        if start_ms >= end_ms:
+            return
+        later_messages = self.store.list_messages(
+            messages[0].chat_id, start_ms, end_ms, self.settings.max_messages
+        )
+        roster = facts["roster"]
+        roster_set = set(roster)
+        completed = set(facts["homework_members"])
+        late_members: set[str] = set()
+        late_labels: Counter[str] = Counter()
+        expected_label = facts["assignment_label"]
+        expected_thread_ids = {message.thread_id for message in messages if message.thread_id}
+        for raw_message in later_messages:
+            if raw_message.sender_open_id in self.settings.excluded_member_ids:
+                continue
+            name = self.settings.member_aliases.get(
+                raw_message.sender_open_id, raw_message.sender_name
+            )
+            if name not in roster_set or name in completed:
+                continue
+            if raw_message.thread_id in expected_thread_ids and self._is_thread_homework(
+                raw_message
+            ):
+                facts["homework_evidence"][name].append(raw_message.message_id)
+                late_members.add(name)
+                continue
+            message_day = datetime.fromtimestamp(
+                raw_message.create_time_ms / 1000, tz=self.settings.tz
+            ).date()
+            for marker_day, label, position, is_late in self._dated_completion_markers(
+                raw_message.content, message_day
+            ):
+                if not self._is_submission_marker(raw_message.content, position):
+                    continue
+                marker_report_date = self._marker_report_date(marker_day, label)
+                if marker_report_date != report_date and not (
+                    not self.settings.assignment_cycle_start_date
+                    and is_late
+                    and marker_day == message_day
+                ):
+                    continue
+                if expected_label not in {"图片作业", "话题作业"} and label != expected_label:
+                    continue
+                if not self._homework_evidence_kind(raw_message):
+                    continue
+                late_labels[label] += 1
+                facts["homework_evidence"][name].append(raw_message.message_id)
+                late_members.add(name)
+                break
+        if expected_label == "图片作业" and late_labels:
+            facts["assignment_label"] = late_labels.most_common(1)[0][0]
+            facts["homework_source"] = "tag"
+        facts["late_members"] = [name for name in roster if name in late_members]
+        completed.update(late_members)
+        review_members = set(facts["review_members"])
+        facts["homework_members"] = [name for name in roster if name in completed]
+        facts["both"] = [name for name in roster if name in completed and name in review_members]
+        facts["only_homework"] = [
+            name for name in roster if name in completed and name not in review_members
+        ]
+        facts["only_reviews"] = [
+            name for name in roster if name not in completed and name in review_members
+        ]
+        facts["none"] = [
+            name for name in roster if name not in completed and name not in review_members
+        ]
+
+    def _apply_verified_completions(self, report_date: str, facts: Dict[str, Any]) -> None:
+        verifications = self.store.list_homework_verifications(report_date)
+        if not verifications:
+            return
+        roster = facts["roster"]
+        roster_set = set(roster)
+        completed = set(facts["homework_members"])
+        late = set(facts["late_members"])
+        normal = completed - late
+        for verification in verifications:
+            name = self.settings.member_aliases.get(
+                str(verification["member_key"]),
+                str(verification["sender_name"]),
+            )
+            if name not in roster_set:
+                continue
+            evidence_ids = facts["homework_evidence"][name]
+            evidence_ids.extend(verification["evidence_message_ids"])
+            facts["homework_evidence"][name] = list(dict.fromkeys(evidence_ids))
+            status = str(verification["status"])
+            if status == "completed":
+                completed.add(name)
+                normal.add(name)
+                late.discard(name)
+            elif name not in normal:
+                completed.add(name)
+                late.add(name)
+
+        review_members = set(facts["review_members"])
+        facts["homework_members"] = [name for name in roster if name in completed]
+        facts["late_members"] = [name for name in roster if name in late]
+        facts["both"] = [name for name in roster if name in completed and name in review_members]
+        facts["only_homework"] = [
+            name for name in roster if name in completed and name not in review_members
+        ]
+        facts["only_reviews"] = [
+            name for name in roster if name not in completed and name in review_members
+        ]
+        facts["none"] = [
+            name for name in roster if name not in completed and name not in review_members
+        ]
+
+    @staticmethod
+    def _base_cell_text(value: Any) -> str:
+        """兼容多维表格单选字段的几种返回形式。"""
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, list):
+            return GroupSummaryService._base_cell_text(value[0]) if value else ""
+        if isinstance(value, dict):
+            for key in ("name", "text", "value"):
+                if value.get(key) is not None:
+                    return str(value[key]).strip()
+        return str(value).strip()
+
+    def _manual_attendance_overrides(self, report_date: str) -> Dict[str, str]:
+        """从今日打卡表读取组长人工状态。
+
+        读取失败时不吞掉异常：定时催交和日报应当停止发送，
+        避免把已经由组长排除的成员又发到群里。
+        """
+        if not self.settings.base_sync_enabled:
+            return {}
+        records = self.api.list_base_records(self.settings.base_token, self.settings.base_table_id)
+        overrides: Dict[str, str] = {}
+        key_prefix = f"{report_date}|"
+        for record in records:
+            fields = record.get("fields") or {}
+            record_key = self._base_cell_text(fields.get("记录键"))
+            if not record_key.startswith(key_prefix):
+                continue
+            name = self._base_cell_text(fields.get("组员姓名"))
+            manual_value = self._base_cell_text(fields.get("人工状态"))
+            status = _MANUAL_ATTENDANCE_STATUS.get(manual_value)
+            if name and status:
+                overrides[name] = status
+        return overrides
+
+    def _apply_manual_attendance_overrides(
+        self, report_date: str, facts: Dict[str, Any]
+    ) -> List[str]:
+        """把人工状态叠加到系统识别结果，并返回全量名单。"""
+        full_roster = list(facts["roster"])
+        overrides = self._manual_attendance_overrides(report_date)
+        completed = set(facts["homework_members"])
+        late = set(facts["late_members"])
+        excluded: set[str] = set()
+        for name, status in overrides.items():
+            if name not in full_roster:
+                continue
+            if status == "excluded":
+                excluded.add(name)
+                completed.discard(name)
+                late.discard(name)
+            elif status == "completed":
+                completed.add(name)
+                late.discard(name)
+            elif status == "late":
+                completed.add(name)
+                late.add(name)
+            elif status == "missing":
+                completed.discard(name)
+                late.discard(name)
+
+        facts["manual_statuses"] = overrides
+        facts["excluded_members"] = [name for name in full_roster if name in excluded]
+        facts["homework_members"] = [name for name in full_roster if name in completed]
+        facts["late_members"] = [name for name in full_roster if name in late]
+        return full_roster
+
+    @staticmethod
+    def _hide_excluded_members(facts: Dict[str, Any]) -> None:
+        """对外统计不暴露请假/豁免成员的姓名、原因或人数。"""
+        excluded = set(facts.get("excluded_members", ()))
+        if not excluded:
+            return
+        roster = [name for name in facts["roster"] if name not in excluded]
+        completed = set(facts["homework_members"]) - excluded
+        late = set(facts["late_members"]) - excluded
+        reviews = set(facts["review_members"]) - excluded
+        facts["roster"] = roster
+        facts["homework_members"] = [name for name in roster if name in completed]
+        facts["late_members"] = [name for name in roster if name in late]
+        facts["review_members"] = [name for name in roster if name in reviews]
+        facts["both"] = [name for name in roster if name in completed and name in reviews]
+        facts["only_homework"] = [
+            name for name in roster if name in completed and name not in reviews
+        ]
+        facts["only_reviews"] = [
+            name for name in roster if name not in completed and name in reviews
+        ]
+        facts["none"] = [name for name in roster if name not in completed and name not in reviews]
+
+    def _persist_attendance(
+        self, report_date: str, messages: Sequence[StoredMessage], facts: Dict[str, Any]
+    ) -> None:
+        report_date = self.settings.assignment_report_date(report_date)
+        self._apply_late_completions(report_date, messages, facts)
+        self._apply_verified_completions(report_date, facts)
+        full_roster = self._apply_manual_attendance_overrides(report_date, facts)
+        open_id_by_name = {name: open_id for open_id, name in self.settings.member_aliases.items()}
+        open_id_by_name.update(
+            {message.sender_name: message.sender_open_id for message in messages}
+        )
+        homework_members = set(facts["homework_members"])
+        late_members = set(facts["late_members"])
+        review_members = set(facts["review_members"])
+        excluded_members = set(facts.get("excluded_members", ()))
+        records = []
+        for name in full_roster:
+            open_id = open_id_by_name.get(name, "")
+            records.append(
+                AttendanceRecord(
+                    report_date=report_date,
+                    member_key=open_id or f"name:{name}",
+                    sender_open_id=open_id,
+                    sender_name=name,
+                    assignment_label=facts["assignment_label"],
+                    homework_status=(
+                        "excluded"
+                        if name in excluded_members
+                        else "late"
+                        if name in late_members
+                        else "completed"
+                        if name in homework_members
+                        else "missing"
+                    ),
+                    review_status="completed" if name in review_members else "missing",
+                    homework_source=facts["homework_source"],
+                    homework_message_ids=tuple(facts["homework_evidence"].get(name, ())),
+                    review_message_ids=tuple(facts["review_evidence"].get(name, ())),
+                )
+            )
+        self.store.replace_daily_attendance(records)
+        if self.settings.base_sync_enabled:
+            try:
+                self._sync_attendance_to_base(records)
+            except Exception:
+                logger.exception("同步多维表格失败：%s", report_date)
+        self._hide_excluded_members(facts)
+
+    @staticmethod
+    def _format_time_ms(value: int, tz: Any) -> str:
+        if not value:
+            return ""
+        return datetime.fromtimestamp(value / 1000, tz=tz).strftime("%Y-%m-%d %H:%M:%S")
+
+    def _totals_through_date(self, report_date: str) -> str:
+        report_day = datetime.strptime(report_date, "%Y-%m-%d").date()
+        now = datetime.now(tz=self.settings.tz)
+        cutoff_reached = (now.hour, now.minute) >= (
+            self.settings.summary_hour,
+            self.settings.summary_minute,
+        )
+        if report_day < now.date() or (report_day == now.date() and cutoff_reached):
+            return report_date
+        return (report_day - timedelta(days=1)).isoformat()
+
+    def _load_base_record_index(self) -> None:
+        if self._base_index_loaded:
+            return
+        records = self.api.list_base_records(self.settings.base_token, self.settings.base_table_id)
+        self._base_record_index = {
+            str(record["fields"].get("记录键")): str(record["record_id"])
+            for record in records
+            if record.get("record_id") and record.get("fields", {}).get("记录键")
+        }
+        self._base_index_loaded = True
+
+    def _base_fields_for_attendance(self, record: AttendanceRecord) -> Dict[str, Any]:
+        homework_time = self.store.message_time_ms(record.homework_message_ids)
+        review_time = self.store.message_time_ms(record.review_message_ids)
+        iteration = self.store.latest_iteration(record.report_date, record.member_key)
+        cycle_start, _, assignment_number = self.settings.assignment_cycle(record.report_date)
+        current_cycle_start = self.settings.assignment_cycle(
+            datetime.now(tz=self.settings.tz).date()
+        )[0]
+        completed, late, missing = self.store.attendance_totals(
+            record.member_key, self._totals_through_date(record.report_date)
+        )
+        fields: Dict[str, Any] = {
+            "记录键": f"{record.report_date}|{record.member_key}",
+            "日期": f"{record.report_date} 00:00:00",
+            "作业序号": assignment_number,
+            "作业周期": self._assignment_period_label(record.report_date),
+            "周期状态": "当前周期" if cycle_start == current_cycle_start else "历史周期",
+            "作业名称": record.assignment_label,
+            "组员姓名": record.sender_name,
+            "飞书OpenID": record.sender_open_id,
+            "复盘状态": "已复盘" if record.review_status == "completed" else "未复盘",
+            "迭代状态": (
+                "待迭代"
+                if iteration and iteration["status"] == "pending"
+                else "已迭代"
+                if iteration and iteration["status"] == "completed"
+                else "无需迭代"
+            ),
+            "迭代发起人": str(iteration["actor_name"]) if iteration else "",
+            "作业证据消息ID": "、".join(record.homework_message_ids),
+            "复盘证据消息ID": "、".join(record.review_message_ids),
+            "正常提交累计": completed,
+            "补卡累计": late,
+            "旷卡累计": missing,
+        }
+        status_value = {
+            "completed": "已提交",
+            "late": "补卡",
+            "missing": "未提交",
+        }.get(record.homework_status)
+        if status_value:
+            fields["作业状态"] = status_value
+        if homework_time:
+            fields["提交时间"] = self._format_time_ms(homework_time, self.settings.tz)
+        if review_time:
+            fields["复盘时间"] = self._format_time_ms(review_time, self.settings.tz)
+        if iteration:
+            fields["迭代时间"] = self._format_time_ms(
+                int(iteration["event_time_ms"]), self.settings.tz
+            )
+        return fields
+
+    def _refresh_base_cycle_statuses(self, current_report_date: str) -> int:
+        """把上一次作业从当前周期转为历史周期。"""
+        current_report_date = self.settings.assignment_report_date(current_report_date)
+        records = self.api.list_base_records(self.settings.base_token, self.settings.base_table_id)
+        updated = 0
+        for record in records:
+            fields = record.get("fields") or {}
+            record_key = self._base_cell_text(fields.get("记录键"))
+            record_id = str(record.get("record_id") or "")
+            if not record_key or not record_id or "|" not in record_key:
+                continue
+            row_date = record_key.split("|", 1)[0]
+            desired = "当前周期" if row_date == current_report_date else "历史周期"
+            actual = self._base_cell_text(fields.get("周期状态"))
+            if actual == desired:
+                continue
+            self.api.update_base_record(
+                self.settings.base_token,
+                self.settings.base_table_id,
+                record_id,
+                {"周期状态": desired},
+            )
+            updated += 1
+        return updated
+
+    def _sync_attendance_to_base(self, records: Sequence[AttendanceRecord]) -> Dict[str, int]:
+        if not self.settings.base_sync_enabled:
+            return {"created": 0, "updated": 0, "skipped": len(records)}
+        self._load_base_record_index()
+        counts = {"created": 0, "updated": 0, "skipped": 0}
+        for record in records:
+            fields = self._base_fields_for_attendance(record)
+            record_key = str(fields["记录键"])
+            payload_hash = hashlib.sha256(
+                json.dumps(fields, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            ).hexdigest()
+            state = self.store.base_sync_state(record_key)
+            record_id = state[0] if state else self._base_record_index.get(record_key, "")
+            if state and state[1] == payload_hash:
+                counts["skipped"] += 1
+                continue
+            payload = dict(fields)
+            payload["最后同步时间"] = datetime.now(tz=self.settings.tz).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+            if record_id:
+                self.api.update_base_record(
+                    self.settings.base_token,
+                    self.settings.base_table_id,
+                    record_id,
+                    payload,
+                )
+                counts["updated"] += 1
+            else:
+                record_id = self.api.create_base_record(
+                    self.settings.base_token, self.settings.base_table_id, payload
+                )
+                if not record_id:
+                    self._base_index_loaded = False
+                    self._load_base_record_index()
+                    record_id = self._base_record_index.get(record_key, "")
+                if not record_id:
+                    raise RuntimeError(f"多维表格创建记录后没有返回 record_id：{record_key}")
+                self._base_record_index[record_key] = record_id
+                counts["created"] += 1
+            self.store.save_base_sync_state(record_key, record_id, payload_hash)
+        current_report_date = self.settings.assignment_report_date(
+            datetime.now(tz=self.settings.tz).date()
+        )
+        if records and records[0].report_date == current_report_date:
+            self._refresh_base_cycle_statuses(current_report_date)
+        return counts
+
+    def sync_attendance_date(self, report_date: str, chat_id: str) -> int:
+        report_date = self.settings.assignment_report_date(report_date)
+        cycle_start, cycle_end, _ = self.settings.assignment_cycle(report_date)
+        start_ms, _ = _day_range_ms(cycle_start, self.settings.tz)
+        _, end_ms = _day_range_ms(cycle_end, self.settings.tz)
+        messages = self.store.list_messages(
+            chat_id, start_ms, end_ms, limit=self.settings.max_messages
+        )
+        messages = self._apply_member_aliases(
+            [
+                message
+                for message in messages
+                if message.sender_open_id not in self.settings.excluded_member_ids
+            ]
+        )
+        homework_messages = self._assignment_window_messages(
+            report_date,
+            chat_id,
+            self.settings.assignment_due_hour,
+            self.settings.assignment_due_minute,
+        )
+        late_messages = self._post_deadline_messages(report_date, chat_id)
+        if not messages and not homework_messages and not late_messages:
+            logger.info("没有可同步消息，跳过：%s %s", report_date, chat_id)
+            return 0
+        facts = self._completion_facts(report_date, messages, homework_messages=homework_messages)
+        self._persist_attendance(report_date, homework_messages or late_messages or messages, facts)
+        return len(facts["roster"])
+
+    def sync_assignment_deadline(self, report_date: str) -> int:
+        total = 0
+        for chat_id in sorted(set(self.settings.chat_ids) | set(self.store.list_chats())):
+            try:
+                total += self.sync_attendance_date(report_date, chat_id)
+            except Exception:
+                logger.exception("截止时间同步打卡状态失败：%s %s", report_date, chat_id)
+        logger.info("截止时间打卡状态已刷新：%s 共 %d 条", report_date, total)
+        return total
+
+    def sync_stored_attendance_date(self, report_date: str) -> int:
+        records = self.store.list_daily_attendance(report_date)
+        if not records:
+            logger.info("没有已存打卡状态，跳过：%s", report_date)
+            return 0
+        self._sync_attendance_to_base(records)
+        return len(records)
+
+    def _homework_reaction_pool(
+        self,
+        report_date: str,
+        submitted_at: datetime,
+        homework_status: str,
+    ) -> Tuple[str, ...]:
+        deadline = self.settings.assignment_deadline(report_date)
+        if homework_status == "late" or submitted_at > deadline:
+            return _MAKEUP_HOMEWORK_REACTIONS
+        cycle_start, _, _ = self.settings.assignment_cycle(report_date)
+        if submitted_at.date() == cycle_start:
+            return _FIRST_DAY_HOMEWORK_REACTIONS
+        return _SECOND_DAY_HOMEWORK_REACTIONS
+
+    def _maybe_react_to_homework(
+        self,
+        message: StoredMessage,
+        report_dates: Sequence[str],
+        submitted_at: datetime,
+    ) -> bool:
+        if not self.settings.send_enabled or not self.settings.homework_reaction_enabled:
+            return False
+        if self.store.homework_reaction_sent(message.message_id):
+            return False
+        for raw_report_date in report_dates:
+            report_date = self.settings.assignment_report_date(raw_report_date)
+            for record in self.store.list_daily_attendance(report_date):
+                if message.message_id not in record.homework_message_ids:
+                    continue
+                if record.homework_status not in {"completed", "late"}:
+                    continue
+                emoji_type = choice(
+                    self._homework_reaction_pool(
+                        report_date,
+                        submitted_at,
+                        record.homework_status,
+                    )
+                )
+                try:
+                    reaction_id = self.api.add_reaction(message.message_id, emoji_type)
+                except Exception:
+                    logger.exception(
+                        "作业已识别，但添加表情回复失败：%s %s",
+                        report_date,
+                        message.message_id,
+                    )
+                    return False
+                self.store.mark_homework_reaction_sent(
+                    message_id=message.message_id,
+                    report_date=report_date,
+                    chat_id=message.chat_id,
+                    emoji_type=emoji_type,
+                    reaction_id=reaction_id,
+                )
+                logger.info(
+                    "已为作业添加表情回复：%s %s %s",
+                    report_date,
+                    message.message_id,
+                    emoji_type,
+                )
+                return True
+        return False
+
+    @staticmethod
+    def _names(names: Sequence[str]) -> str:
+        return "、".join(names) if names else "无"
+
+    def _report_context(self, facts: Dict[str, Any]) -> str:
+        review_counts: Counter[str] = facts["review_counts"]
+        review_detail = "、".join(
+            f"{name}（{review_counts[name]} 条）" for name in facts["review_members"]
+        )
+        return (
+            f"群成员总数：{len(facts['roster'])} 人\n"
+            f"{facts['assignment_label']}完成人员：{self._names(facts['homework_members'])}\n"
+            f"当日有效复盘人员及条数：{review_detail or '无'}\n"
+            f"有效复盘名单JSON：{json.dumps(facts['review_members'], ensure_ascii=False)}\n"
+            "只把带复盘标签且归属报告日期的消息整理进每日复盘。"
+        )
+
+    @staticmethod
+    def _fallback_analysis(messages: Sequence[StoredMessage], facts: Dict[str, Any]) -> str:
+        """Keep the report usable without allowing model failure to alter facts."""
+        by_id = {message.message_id: message for message in messages}
+        lines = [f"📝 每日复盘（{len(facts['review_members'])} 人）", ""]
+        if not facts["review_members"]:
+            lines.append("无")
+        for index, name in enumerate(facts["review_members"], start=1):
+            evidence = [
+                by_id[message_id]
+                for message_id in facts["review_evidence"].get(name, ())
+                if message_id in by_id
+            ]
+            title = f"{index}. {name}"
+            if len(evidence) > 1:
+                title += f"（{len(evidence)} 条）"
+            lines.extend([title])
+            for item_index, message in enumerate(evidence, start=1):
+                content = _REVIEW_MARKER.sub("", message.content, count=1).strip(" ：:")
+                if not content:
+                    content = "（仅识别到复盘标签，未读取到可整理正文）"
+                prefix = f"第 {item_index} 条：" if len(evidence) > 1 else ""
+                lines.append(prefix + content[:2000])
+            lines.append("")
+        lines.extend(
+            [
+                "💬 群内反馈",
+                "",
+                "MiniMax 暂时未返回可用结果，本栏未自动整理。",
+                "",
+                "🔍 方法与待解决",
+                "",
+                "方法沉淀：MiniMax 暂时未返回可用结果。",
+                "待解决问题：MiniMax 暂时未返回可用结果。",
+            ]
+        )
+        return "\n".join(lines).strip()
+
+    def _render_report(
+        self,
+        report_date: str,
+        messages: Sequence[StoredMessage],
+        facts: Dict[str, Any],
+        analysis: str,
+        generated_at: datetime,
+    ) -> str:
+        day = datetime.strptime(report_date, "%Y-%m-%d").date()
+        total = len(facts["roster"])
+        assignment_label = facts["assignment_label"]
+        assignment_short = "图片" if assignment_label == "图片作业" else assignment_label
+        both = facts["both"]
+        only_homework = facts["only_homework"]
+        only_reviews = facts["only_reviews"]
+        none = facts["none"]
+        missing_review = [name for name in facts["roster"] if name not in facts["review_members"]]
+        missing_homework = [
+            name for name in facts["roster"] if name not in facts["homework_members"]
+        ]
+        cutoff = (
+            generated_at
+            if generated_at.date() == day
+            else max(
+                datetime.fromtimestamp(message.create_time_ms / 1000, tz=self.settings.tz)
+                for message in messages
+            )
+        )
+        lines = [
+            self.settings.report_title,
+            "",
+            f"日期：{day.year} 年 {day.month} 月 {day.day} 日（截至 {cutoff:%H:%M}）",
+            "",
+            "",
+            "📊 今日总览",
+            "",
+            f"群成员总数：{total} 人",
+            f"群内消息：{len(messages)} 条（含图片 {facts['image_count']} 张）",
+            f"完成{assignment_label}：{len(facts['homework_members'])}/{total}",
+            f"完成复盘作业：{len(facts['review_members'])}/{total}",
+            f"两项均完成：{len(both)}/{total}",
+            f"未完成任意一项：{total - len(both)} 人",
+            "",
+            "",
+            "✅ 完成情况",
+            "",
+            f"{assignment_label}（{len(facts['homework_members'])}/{total}）",
+            "",
+            f"复盘作业（{len(facts['review_members'])}/{total}）",
+            "",
+            f"两项均完成（{len(both)} 人）：",
+            self._names(both),
+            "",
+            f"仅完成{assignment_short}（{len(only_homework)} 人）：",
+            self._names(only_homework),
+            "",
+            f"仅完成复盘（{len(only_reviews)} 人）：",
+            self._names(only_reviews),
+            "",
+            "",
+            "⚠️ 未完成人员",
+            "",
+            f"缺复盘（{len(missing_review)} 人）：",
+            self._names(missing_review),
+            "",
+            f"缺{assignment_short}（{len(missing_homework)} 人）：",
+            self._names(missing_homework),
+            "",
+            f"两项均未完成（{len(none)} 人）：",
+            self._names(none),
+        ]
+        if not only_reviews:
+            lines.extend(["", f"说明：今日无“仅缺{assignment_short}但已交复盘”的人员。"])
+        lines.extend(
+            [
+                "",
+                "",
+                analysis.strip() or f"📝 每日复盘（{len(facts['review_members'])} 人）\n\n无",
+                "",
+                "",
+                "📎 打卡表链接",
+                "",
+                f"[点击查看打卡表]({self.settings.report_link})",
+                "",
+                "",
+                "本日报由系统自动生成，仅统计可读文字内容，图片仅计数量不识别内容。",
+            ]
+        )
+        return "\n".join(lines)
+
+    def handle_message(self, message: IncomingMessage) -> bool:
+        if message.sender_type != "user" or message.chat_type != "group":
+            return False
+        if not self._chat_allowed(message.chat_id):
+            return False
+        if self._is_excluded(message.sender_open_id):
+            logger.info("忽略被排除成员的消息：%s", message.message_id)
+            return False
+
+        text = self._message_text(message).strip()
+        if not text:
+            return False
+        submitted_at = datetime.fromtimestamp(message.create_time_ms / 1000, tz=self.settings.tz)
+
+        mentioned_query = self._mentioned_query(text)
+        command_text = mentioned_query if mentioned_query is not None else text
+        if self._is_summary_command(command_text) or (
+            mentioned_query is not None and "日报" in mentioned_query
+        ):
+            if not self.settings.send_enabled:
+                logger.info("发送已关闭，忽略群内总结指令：%s", message.message_id)
+                return False
+            requested_report_date = self._query_report_date(command_text, submitted_at.date())
+            result = self.build_summary(requested_report_date, message.chat_id)
+            if result is None:
+                reply = f"{requested_report_date} 还没有收到可总结的群消息。"
+            else:
+                reply = result.text
+            self.api.reply_post(message.message_id, reply, f"summary-command-{message.message_id}")
+            return True
+
+        stored = StoredMessage(
+            message_id=message.message_id,
+            chat_id=message.chat_id,
+            sender_open_id=message.sender_open_id,
+            sender_name=self._resolve_sender_name(message.chat_id, message.sender_open_id),
+            message_type=message.message_type,
+            content=text,
+            create_time_ms=message.create_time_ms,
+            parent_id=message.parent_id or "",
+            root_id=message.root_id or "",
+            thread_id=message.thread_id or "",
+        )
+        inserted = self.store.add_message(stored)
+        if inserted:
+            logger.info("已收集群消息：chat=%s message=%s", message.chat_id, message.message_id)
+        if self._record_iteration(text, stored):
+            return True
+        if inserted:
+            report_dates = self._submission_report_dates(text, submitted_at.date())
+            if not report_dates and (
+                stored.message_type in _THREAD_HOMEWORK_TYPES
+                or "[图片]" in stored.content
+                or self._is_thread_homework(stored)
+            ):
+                report_dates = [self.settings.assignment_report_date(submitted_at.date())]
+            for report_date in report_dates:
+                try:
+                    self.sync_attendance_date(report_date, message.chat_id)
+                except Exception:
+                    logger.exception(
+                        "新提交消息触发打卡同步失败：%s %s",
+                        report_date,
+                        message.message_id,
+                    )
+            self._maybe_react_to_homework(stored, report_dates, submitted_at)
+        if mentioned_query is not None and self.settings.send_enabled:
+            if self._is_makeup_verification_request(mentioned_query):
+                reply = self._answer_self_makeup_verification(
+                    mentioned_query,
+                    submitted_at.date(),
+                    stored,
+                )
+                self.api.reply_text(
+                    message.message_id,
+                    reply,
+                    f"self-makeup-{message.message_id}",
+                )
+                return True
+            reply = self._answer_stats_question(
+                mentioned_query, submitted_at.date(), message.chat_id
+            )
+            if reply is None:
+                reply = "我目前只支持查询作业、复盘、未交名单和日报。"
+            if _MEMBER_HISTORY_INTENT.search(mentioned_query):
+                self.api.reply_post(
+                    message.message_id,
+                    reply,
+                    f"member-history-{message.message_id}",
+                )
+            else:
+                self.api.reply_text(
+                    message.message_id,
+                    reply,
+                    f"stats-question-{message.message_id}",
+                )
+            return True
+        return inserted
+
+    def _load_messages(self, report_date: str, chat_id: str) -> List[StoredMessage]:
+        day = datetime.strptime(report_date, "%Y-%m-%d").date()
+        start_ms, end_ms = _day_range_ms(day, self.settings.tz)
+        messages = self.store.list_messages(
+            chat_id, start_ms, end_ms, limit=self.settings.max_messages
+        )
+        return [
+            message
+            for message in messages
+            if message.sender_open_id not in self.settings.excluded_member_ids
+        ]
+
+    @staticmethod
+    def _canonicalize_visible_names(content: str, aliases: Dict[str, str]) -> str:
+        for old_name, new_name in aliases.items():
+            content = content.replace(f"@{old_name}", f"@{new_name}")
+            if old_name.startswith(("飞书用户", "用户")):
+                content = content.replace(old_name, new_name)
+        return content
+
+    @staticmethod
+    def _transcript_lines(
+        messages: Sequence[StoredMessage],
+        tz: Any,
+        visible_name_aliases: Optional[Dict[str, str]] = None,
+    ) -> List[str]:
+        lines: List[str] = []
+        for message in messages:
+            sent_at = datetime.fromtimestamp(message.create_time_ms / 1000, tz=tz)
+            content = GroupSummaryService._canonicalize_visible_names(
+                " ".join(message.content.split()),
+                visible_name_aliases or {},
+            )
+            lines.append(f"[{sent_at:%H:%M}] {message.sender_name}：{content}")
+        return lines
+
+    @staticmethod
+    def _participant_lines(messages: Sequence[StoredMessage], tz: Any) -> List[str]:
+        activity: Dict[str, Dict[str, Any]] = {}
+        for message in messages:
+            item = activity.setdefault(
+                message.sender_open_id,
+                {
+                    "name": message.sender_name,
+                    "count": 0,
+                    "first": message.create_time_ms,
+                    "last": message.create_time_ms,
+                },
+            )
+            item["count"] += 1
+            item["first"] = min(item["first"], message.create_time_ms)
+            item["last"] = max(item["last"], message.create_time_ms)
+
+        lines: List[str] = []
+        for item in sorted(activity.values(), key=lambda value: value["first"]):
+            first = datetime.fromtimestamp(item["first"] / 1000, tz=tz)
+            last = datetime.fromtimestamp(item["last"] / 1000, tz=tz)
+            time_range = f"{first:%H:%M}" if first == last else f"{first:%H:%M}–{last:%H:%M}"
+            lines.append(f"- {item['name']}：{item['count']} 条，{time_range}")
+        return lines
+
+    def build_summary(self, report_date: str, chat_id: str) -> Optional[SummaryResult]:
+        messages = self._named_messages(report_date, chat_id)
+        if not messages:
+            return None
+        participants = {message.sender_open_id for message in messages}
+        homework_messages = self._assignment_window_messages(
+            report_date,
+            chat_id,
+            self.settings.missing_list_hour,
+            self.settings.missing_list_minute,
+        )
+        facts = self._completion_facts(report_date, messages, homework_messages=homework_messages)
+        self._persist_attendance(report_date, homework_messages or messages, facts)
+        try:
+            summary = self.summarizer.summarize(
+                report_date,
+                self._transcript_lines(
+                    messages,
+                    self.settings.tz,
+                    self.settings.visible_name_aliases,
+                ),
+                report_context=self._report_context(facts),
+            )
+        except Exception:
+            logger.exception("MiniMax 总结失败，改用可核验原文兜底：%s %s", report_date, chat_id)
+            summary = self._fallback_analysis(messages, facts)
+        generated_at = datetime.now(tz=self.settings.tz)
+        text = self._render_report(report_date, messages, facts, summary, generated_at)
+        return SummaryResult(
+            chat_id=chat_id,
+            report_date=report_date,
+            text=text[:120_000],
+            message_count=len(messages),
+            participant_count=len(participants),
+            generated_at=generated_at,
+        )
+
+    def send_summary(
+        self, report_date: str, chat_id: str, *, force: bool = False, dry_run: bool = False
+    ) -> Optional[SummaryResult]:
+        if not self.settings.send_enabled and not dry_run:
+            logger.info("发送已关闭，仅生成本地预览：%s %s", report_date, chat_id)
+            dry_run = True
+        if not force and self.store.summary_sent(report_date, chat_id):
+            logger.info("群聊总结已发送，跳过：%s %s", report_date, chat_id)
+            return None
+        result = self.build_summary(report_date, chat_id)
+        if result is None or dry_run:
+            return result
+        result.message_id = self.api.send_post(
+            chat_id, result.text, f"group-summary-{report_date}-{chat_id}"[:50]
+        )
+        self.store.mark_summary_sent(report_date, chat_id, result.message_id or "")
+        return result
+
+    def build_daily_brief(self, report_date: str, chat_id: str) -> SummaryResult:
+        """生成 23:00 群内简报：更新打卡表，但不调用模型生成长日报。"""
+        day = datetime.strptime(report_date, "%Y-%m-%d").date()
+        assignment_date = self.settings.assignment_report_date(report_date)
+        messages = self._named_messages(report_date, chat_id)
+        homework_messages = self._assignment_window_messages(
+            assignment_date,
+            chat_id,
+            self.settings.assignment_due_hour,
+            self.settings.assignment_due_minute,
+        )
+        late_messages = self._post_deadline_messages(assignment_date, chat_id)
+        facts = self._completion_facts(
+            assignment_date,
+            messages,
+            homework_messages=homework_messages,
+        )
+        self._persist_attendance(
+            assignment_date,
+            homework_messages or late_messages or messages,
+            facts,
+        )
+        completed = list(facts["homework_members"])
+        late = list(facts["late_members"])
+        normal = [name for name in completed if name not in set(late)]
+        total = len(facts["roster"])
+        missing_count = total - len(completed)
+        lines = [
+            self.settings.report_title,
+            "",
+            f"日期：{day.year} 年 {day.month} 月 {day.day} 日（截至 23:00）",
+            f"作业周期：{self._assignment_period_label(assignment_date)}",
+            "",
+            "📊 今日打卡",
+            "",
+            f"应统计：{total} 人",
+            (
+                f"作业完成：{len(completed)}/{total}"
+                f"（正常 {len(normal)}，补卡 {len(late)}，未交 {missing_count}）"
+            ),
+            f"当日复盘：{len(facts['review_members'])}/{total}",
+            f"群内消息：{len(messages)} 条（含图片 {facts['image_count']} 张）",
+        ]
+        if self.settings.report_link:
+            lines.extend(["", "📎 今日打卡表", "", f"[点击查看]({self.settings.report_link})"])
+        return SummaryResult(
+            chat_id=chat_id,
+            report_date=report_date,
+            text="\n".join(lines),
+            message_count=len(messages),
+            participant_count=len({message.sender_open_id for message in messages}),
+            generated_at=datetime.now(tz=self.settings.tz),
+        )
+
+    def send_daily_brief(self, report_date: str, chat_id: str) -> Optional[SummaryResult]:
+        if not self.settings.send_enabled:
+            return None
+        if self.store.summary_sent(report_date, chat_id):
+            logger.info("每日简报已发送，跳过：%s %s", report_date, chat_id)
+            return None
+        result = self.build_daily_brief(report_date, chat_id)
+        result.message_id = self.api.send_post(
+            chat_id,
+            result.text,
+            f"daily-brief-{report_date}-{chat_id}"[:50],
+        )
+        self.store.mark_summary_sent(report_date, chat_id, result.message_id or "")
+        return result
+
+    def send_due_summaries(self, report_date: Optional[str] = None) -> List[SummaryResult]:
+        if not self.settings.send_enabled:
+            logger.info("发送已关闭，跳过定时总结")
+            return []
+        day = report_date or self._scheduled_report_date()
+        chat_ids = sorted(set(self.settings.chat_ids) | set(self.store.list_chats()))
+        if not chat_ids:
+            logger.warning("还没有已知群聊；把机器人加入群并发一条消息后会自动记住")
+            return []
+        results: List[SummaryResult] = []
+        for chat_id in chat_ids:
+            try:
+                result = self.send_daily_brief(day, chat_id)
+                if result:
+                    results.append(result)
+            except Exception:
+                logger.exception("发送群聊总结失败：%s %s", day, chat_id)
+        return results
+
+    def send_reminder(self, report_date: str, chat_id: str) -> str:
+        report_date = self.settings.assignment_report_date(report_date)
+        if not self.settings.send_enabled or not self.settings.reminder_enabled:
+            return ""
+        if self.store.reminder_sent(report_date, chat_id):
+            logger.info("打卡提醒已发送，跳过：%s %s", report_date, chat_id)
+            return ""
+        messages = self._named_messages(report_date, chat_id)
+        homework_messages = self._assignment_window_messages(
+            report_date,
+            chat_id,
+            self.settings.reminder_hour,
+            self.settings.reminder_minute,
+        )
+        if not messages and not homework_messages:
+            logger.info("当天没有可统计消息，不发送提醒：%s %s", report_date, chat_id)
+            return ""
+        facts = self._completion_facts(report_date, messages, homework_messages=homework_messages)
+        if not facts["assignment_detected"]:
+            logger.info("当天未识别到作业，不发送催交：%s %s", report_date, chat_id)
+            return ""
+        self._persist_attendance(report_date, homework_messages or messages, facts)
+        homework_completed = set(facts["homework_members"])
+        homework_missing = [name for name in facts["roster"] if name not in homework_completed]
+        union_missing = list(homework_missing)
+        open_id_by_name = {name: open_id for open_id, name in self.settings.member_aliases.items()}
+        open_id_by_name.update(
+            {message.sender_name: message.sender_open_id for message in messages}
+        )
+        mentions = [
+            (open_id_by_name[name], name) for name in union_missing if open_id_by_name.get(name)
+        ]
+        if not mentions:
+            return ""
+        message_id = self.api.send_attendance_reminder(
+            chat_id,
+            mentions,
+            homework_missing,
+            [],
+            f"attendance-reminder-{report_date}-{chat_id}"[:50],
+        )
+        self.store.mark_reminder_sent(report_date, chat_id, message_id)
+        return message_id
+
+    def send_due_reminders(self, report_date: Optional[str] = None) -> List[str]:
+        if not self.settings.send_enabled or not self.settings.reminder_enabled:
+            return []
+        day = report_date or datetime.now(tz=self.settings.tz).date().isoformat()
+        if not self.settings.is_assignment_due_day(day):
+            logger.info("今天不是作业截止日，跳过催交：%s", day)
+            return []
+        assignment_date = self.settings.assignment_report_date(day)
+        message_ids: List[str] = []
+        for chat_id in sorted(set(self.settings.chat_ids) | set(self.store.list_chats())):
+            try:
+                if message_id := self.send_reminder(assignment_date, chat_id):
+                    message_ids.append(message_id)
+            except Exception:
+                logger.exception("发送打卡提醒失败：%s %s", day, chat_id)
+        return message_ids
+
+    def send_missing_list(self, report_date: str, chat_id: str) -> str:
+        report_date = self.settings.assignment_report_date(report_date)
+        if not self.settings.send_enabled or not self.settings.missing_list_enabled:
+            return ""
+        if self.store.missing_list_sent(report_date, chat_id):
+            logger.info("未交作业名单已发送，跳过：%s %s", report_date, chat_id)
+            return ""
+        messages = self._named_messages(report_date, chat_id)
+        homework_messages = self._assignment_window_messages(
+            report_date,
+            chat_id,
+            self.settings.missing_list_hour,
+            self.settings.missing_list_minute,
+        )
+        facts = self._completion_facts(report_date, messages, homework_messages=homework_messages)
+        if not facts["assignment_detected"]:
+            logger.info("当天未识别到作业，不发送未交名单：%s %s", report_date, chat_id)
+            return ""
+        self._persist_attendance(report_date, homework_messages or messages, facts)
+        completed = set(facts["homework_members"])
+        missing = [name for name in facts["roster"] if name not in completed]
+        text = "\n".join(
+            [
+                (
+                    f"{self.settings.missing_list_hour:02d}:"
+                    f"{self.settings.missing_list_minute:02d} 未交作业名单"
+                ),
+                "",
+                f"{facts['assignment_label']}已完成 {len(completed)}/{len(facts['roster'])}",
+                f"未完成（{len(missing)}人）：",
+                self._names(missing),
+            ]
+        )
+        message_id = self.api.send_post(
+            chat_id,
+            text,
+            f"missing-homework-list-{report_date}-{chat_id}"[:50],
+        )
+        self.store.mark_missing_list_sent(report_date, chat_id, message_id)
+        return message_id
+
+    def send_due_missing_lists(self, report_date: Optional[str] = None) -> List[str]:
+        if not self.settings.send_enabled or not self.settings.missing_list_enabled:
+            return []
+        day = report_date or datetime.now(tz=self.settings.tz).date().isoformat()
+        if not self.settings.is_assignment_due_day(day):
+            logger.info("今天不是作业截止日，跳过未交名单：%s", day)
+            return []
+        assignment_date = self.settings.assignment_report_date(day)
+        message_ids: List[str] = []
+        for chat_id in sorted(set(self.settings.chat_ids) | set(self.store.list_chats())):
+            try:
+                if message_id := self.send_missing_list(assignment_date, chat_id):
+                    message_ids.append(message_id)
+            except Exception:
+                logger.exception("发送未交作业名单失败：%s %s", day, chat_id)
+        return message_ids
+
+    def send_final_status(self, report_date: str, chat_id: str) -> str:
+        report_date = self.settings.assignment_report_date(report_date)
+        if not self.settings.send_enabled or not self.settings.final_status_enabled:
+            return ""
+        if self.store.final_status_sent(report_date, chat_id):
+            logger.info("最终打卡汇总已发送，跳过：%s %s", report_date, chat_id)
+            return ""
+        messages = self._named_messages(report_date, chat_id)
+        homework_messages = self._assignment_window_messages(
+            report_date,
+            chat_id,
+            self.settings.assignment_due_hour,
+            self.settings.assignment_due_minute,
+        )
+        facts = self._completion_facts(report_date, messages, homework_messages=homework_messages)
+        if not facts["assignment_detected"]:
+            logger.info("当期未识别到作业，不发送最终汇总：%s %s", report_date, chat_id)
+            return ""
+        self._persist_attendance(report_date, homework_messages or messages, facts)
+        completed = list(facts["homework_members"])
+        completed_set = set(completed)
+        missing = [name for name in facts["roster"] if name not in completed_set]
+        text = "\n".join(
+            [
+                f"{self._assignment_period_label(report_date)}・打卡汇总",
+                "",
+                f"{facts['assignment_label']}已完成 {len(completed)}/{len(facts['roster'])}",
+                f"已完成（{len(completed)}人）：",
+                self._names(completed),
+                "",
+                f"未完成（{len(missing)}人）：",
+                self._names(missing),
+            ]
+        )
+        message_id = self.api.send_post(
+            chat_id,
+            text,
+            f"final-attendance-{report_date}-{chat_id}"[:50],
+        )
+        self.store.mark_final_status_sent(report_date, chat_id, message_id)
+        return message_id
+
+    def send_due_final_statuses(self, report_date: Optional[str] = None) -> List[str]:
+        if not self.settings.send_enabled or not self.settings.final_status_enabled:
+            return []
+        day = report_date or datetime.now(tz=self.settings.tz).date().isoformat()
+        if not self.settings.is_assignment_due_day(day):
+            logger.info("今天不是作业截止日，跳过最终汇总：%s", day)
+            return []
+        assignment_date = self.settings.assignment_report_date(day)
+        message_ids: List[str] = []
+        for chat_id in sorted(set(self.settings.chat_ids) | set(self.store.list_chats())):
+            try:
+                if message_id := self.send_final_status(assignment_date, chat_id):
+                    message_ids.append(message_id)
+            except Exception:
+                logger.exception("发送最终打卡汇总失败：%s %s", assignment_date, chat_id)
+        return message_ids
+
+    def _makeup_facts(self, report_date: str, chat_id: str) -> Optional[Dict[str, Any]]:
+        report_date = self.settings.assignment_report_date(report_date)
+        messages = self._named_messages(report_date, chat_id)
+        homework_messages = self._assignment_window_messages(
+            report_date,
+            chat_id,
+            self.settings.assignment_due_hour,
+            self.settings.assignment_due_minute,
+        )
+        if not messages and not homework_messages:
+            return None
+        facts = self._completion_facts(report_date, messages, homework_messages=homework_messages)
+        if not facts["assignment_detected"]:
+            return None
+        self._persist_attendance(report_date, homework_messages or messages, facts)
+        return facts
+
+    def send_makeup_reminder(self, report_date: str, chat_id: str) -> str:
+        report_date = self.settings.assignment_report_date(report_date)
+        if not self.settings.send_enabled or not self.settings.makeup_reminder_enabled:
+            return ""
+        if self.store.makeup_reminder_sent(report_date, chat_id):
+            logger.info("补交提醒已发送，跳过：%s %s", report_date, chat_id)
+            return ""
+        facts = self._makeup_facts(report_date, chat_id)
+        if facts is None:
+            logger.info("当期未识别到作业，不发送补交提醒：%s %s", report_date, chat_id)
+            return ""
+        completed = set(facts["homework_members"])
+        missing = [name for name in facts["roster"] if name not in completed]
+        if not missing:
+            return ""
+        open_id_by_name = {name: open_id for open_id, name in self.settings.member_aliases.items()}
+        mentions = [(open_id_by_name[name], name) for name in missing if open_id_by_name.get(name)]
+        if not mentions:
+            return ""
+        message_id = self.api.send_makeup_reminder(
+            chat_id,
+            mentions,
+            missing,
+            f"makeup-reminder-{report_date}-{chat_id}"[:50],
+        )
+        self.store.mark_makeup_reminder_sent(report_date, chat_id, message_id)
+        return message_id
+
+    def send_due_makeup_reminders(self, report_date: Optional[str] = None) -> List[str]:
+        if not self.settings.send_enabled or not self.settings.makeup_reminder_enabled:
+            return []
+        day = report_date or datetime.now(tz=self.settings.tz).date().isoformat()
+        if not self.settings.is_makeup_day(day):
+            logger.info("今天不是补交日，跳过补交提醒：%s", day)
+            return []
+        assignment_date = self.settings.makeup_report_date(day)
+        message_ids: List[str] = []
+        for chat_id in sorted(set(self.settings.chat_ids) | set(self.store.list_chats())):
+            try:
+                if message_id := self.send_makeup_reminder(assignment_date, chat_id):
+                    message_ids.append(message_id)
+            except Exception:
+                logger.exception("发送补交提醒失败：%s %s", assignment_date, chat_id)
+        return message_ids
+
+    def send_makeup_summary(self, report_date: str, chat_id: str) -> str:
+        report_date = self.settings.assignment_report_date(report_date)
+        if not self.settings.send_enabled or not self.settings.makeup_summary_enabled:
+            return ""
+        if self.store.makeup_summary_sent(report_date, chat_id):
+            logger.info("补交汇总已发送，跳过：%s %s", report_date, chat_id)
+            return ""
+        facts = self._makeup_facts(report_date, chat_id)
+        if facts is None:
+            logger.info("当期未识别到作业，不发送补交汇总：%s %s", report_date, chat_id)
+            return ""
+        late = list(facts["late_members"])
+        late_set = set(late)
+        completed = list(facts["homework_members"])
+        completed_set = set(completed)
+        normal = [name for name in completed if name not in late_set]
+        missing = [name for name in facts["roster"] if name not in completed_set]
+        total = len(facts["roster"])
+        text = "\n".join(
+            [
+                f"{self._assignment_period_label(report_date)}・补交汇总",
+                "",
+                f"正常提交：{len(normal)}/{total}",
+                f"已补交：{len(late)}/{total}",
+                f"最终完成：{len(completed)}/{total}",
+                f"仍未交：{len(missing)}/{total}",
+                "",
+                f"已补交（{len(late)}人）：",
+                self._names(late),
+                "",
+                f"仍未交（{len(missing)}人）：",
+                self._names(missing),
+                "",
+                "说明：补交阶段已结束，此时仍未交者记为旷卡。",
+            ]
+        )
+        message_id = self.api.send_post(
+            chat_id,
+            text,
+            f"makeup-summary-{report_date}-{chat_id}"[:50],
+        )
+        self.store.mark_makeup_summary_sent(report_date, chat_id, message_id)
+        return message_id
+
+    def send_due_makeup_summaries(self, report_date: Optional[str] = None) -> List[str]:
+        if not self.settings.send_enabled or not self.settings.makeup_summary_enabled:
+            return []
+        day = report_date or datetime.now(tz=self.settings.tz).date().isoformat()
+        if not self.settings.is_makeup_day(day):
+            logger.info("今天不是补交日，跳过补交汇总：%s", day)
+            return []
+        assignment_date = self.settings.makeup_report_date(day)
+        message_ids: List[str] = []
+        for chat_id in sorted(set(self.settings.chat_ids) | set(self.store.list_chats())):
+            try:
+                if message_id := self.send_makeup_summary(assignment_date, chat_id):
+                    message_ids.append(message_id)
+            except Exception:
+                logger.exception("发送补交汇总失败：%s %s", assignment_date, chat_id)
+        return message_ids
+
+    def _scheduled_report_date(self, now: Optional[datetime] = None) -> str:
+        moment = now or datetime.now(tz=self.settings.tz)
+        day = moment.date()
+        if self.settings.summary_hour == 0 and self.settings.summary_minute == 0:
+            day -= timedelta(days=1)
+        return day.isoformat()

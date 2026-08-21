@@ -1,0 +1,12 @@
+.env
+.DS_Store
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+data/
+config/group_profiles.json
+deploy/feishu-group-summary.production.service
+report-preview/
+scripts/seed_five_assignments.py
