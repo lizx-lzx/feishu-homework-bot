@@ -1288,6 +1288,47 @@ def test_two_day_cycle_counts_both_dates_as_one_assignment(tmp_path):
     assert store.list_daily_attendance("2026-08-18") == []
 
 
+def test_two_day_cycle_accepts_assignment_label_without_ci(tmp_path):
+    original = make_settings(tmp_path)
+    settings = replace(
+        original,
+        assignment_cycle_start_date="2026-08-17",
+        assignment_cycle_days=2,
+        assignment_publish_hour=10,
+        assignment_due_hour=20,
+        report_members=("Arina", "铁匠"),
+        member_aliases={"ou_1": "Arina", "ou_2": "铁匠"},
+    )
+    store = LocalStore(settings.db_path)
+    service = GroupSummaryService(settings, FakeApi(), FakeSummarizer(), store)
+
+    service.handle_message(
+        incoming(
+            "om_arina",
+            "#8月22日 第3作业已完成\n技术作业\n成果链接：https://example.com/arina",
+            created_at=datetime(2026, 8, 22, 14, 9, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+    )
+    service.handle_message(
+        incoming(
+            "om_blacksmith",
+            "#8月22日 第3作业已完成\n技术作业\n成果链接：https://example.com/blacksmith",
+            sender_open_id="ou_2",
+            created_at=datetime(2026, 8, 22, 13, 30, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+    )
+
+    service.sync_attendance_date("2026-08-21", "oc_group")
+
+    attendance = {
+        record.sender_name: record
+        for record in store.list_daily_attendance("2026-08-21")
+    }
+    assert attendance["Arina"].assignment_label == "第3次作业"
+    assert attendance["Arina"].homework_status == "completed"
+    assert attendance["铁匠"].homework_status == "completed"
+
+
 def test_cycle_notifications_only_run_on_second_day_and_final_is_idempotent(tmp_path):
     original = make_settings(tmp_path)
     settings = replace(
