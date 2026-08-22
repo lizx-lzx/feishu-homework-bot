@@ -156,6 +156,7 @@ def test_group_profiles_can_be_loaded_from_file(tmp_path, monkeypatch):
                 "oc_24": {
                     "report_members": ["李"],
                     "member_aliases": {"ou_li": "李"},
+                    "leader_member_ids": ["ou_leader"],
                     "send_enabled": False,
                 }
             },
@@ -180,3 +181,4 @@ def test_group_profiles_can_be_loaded_from_file(tmp_path, monkeypatch):
 
     assert settings.group_profiles["oc_24"]["report_members"] == ["李"]
     assert settings.group_profiles["oc_24"]["member_aliases"] == {"ou_li": "李"}
+    assert settings.group_profiles["oc_24"]["leader_member_ids"] == ["ou_leader"]

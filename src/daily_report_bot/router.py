@@ -56,6 +56,8 @@ def _apply_group_profile(settings: Settings, profile: Dict[str, Any]) -> Setting
                 | {str(item) for item in profile["additional_excluded_member_ids"]}
             )
         )
+    if "leader_member_ids" in profile:
+        updates["leader_member_ids"] = tuple(str(item) for item in profile["leader_member_ids"])
     return replace(settings, **updates)
 
 
@@ -98,6 +100,7 @@ class GroupServiceRouter:
                     report_members=(),
                     member_aliases={},
                     visible_name_aliases={},
+                    leader_member_ids=(),
                     assignment_deadline_overrides={},
                 )
             store = LocalStore(group_settings.db_path)

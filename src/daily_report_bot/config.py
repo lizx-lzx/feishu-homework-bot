@@ -126,6 +126,7 @@ class Settings:
     excluded_member_ids: Tuple[str, ...] = field(
         default_factory=lambda: DEFAULT_EXCLUDED_MEMBER_IDS
     )
+    leader_member_ids: Tuple[str, ...] = ()
     report_title: str = "进阶营作业群・每日日报"
     report_members: Tuple[str, ...] = field(default_factory=lambda: DEFAULT_REPORT_MEMBERS)
     report_link: str = DEFAULT_REPORT_LINK
@@ -305,6 +306,7 @@ def load_settings(env_file: str = ".env") -> Settings:
         member_aliases=_load_member_aliases(),
         visible_name_aliases=_json_string_map("VISIBLE_NAME_ALIASES_JSON"),
         excluded_member_ids=_load_excluded_member_ids(),
+        leader_member_ids=_csv("LEADER_MEMBER_IDS"),
         report_title=os.getenv("REPORT_TITLE", "进阶营作业群・每日日报"),
         report_members=_csv("REPORT_MEMBERS") or DEFAULT_REPORT_MEMBERS,
         report_link=os.getenv("REPORT_LINK", DEFAULT_REPORT_LINK),

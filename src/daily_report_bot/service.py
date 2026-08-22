@@ -61,6 +61,14 @@ _QUERY_FULL_DATE = re.compile(
 _QUERY_MONTH_DAY = re.compile(r"(?<!\d)(?P<month>\d{1,2})[月./-](?P<day>\d{1,2})(?:日)?(?!\d)")
 _QUERY_MMDD = re.compile(r"(?<!\d)(?P<month>0[1-9]|1[0-2])(?P<day>[0-3]\d)(?!\d)")
 _STATS_TOPIC = re.compile(r"作业|打卡|提交|没交|未交|完成|复盘|迭代")
+_TABLE_LINK_INTENT = re.compile(
+    r"(?:打开|查看|唤出|调出|发给我|给我).{0,8}(?:打卡表|表格)"
+    r"|(?:打卡表|表格).{0,8}(?:链接|在哪|打开|查看)"
+)
+_LEADER_OVERRIDE_STATUS = re.compile(
+    r"(?P<status>未提交|没交|未完成|已完成补交|已完成补卡|已补交|补交|"
+    r"已补卡|补卡|正常提交|已提交|已完成|完成)\s*[。.!！]*$"
+)
 _MISSING_INTENT = re.compile(r"没交|未交|没完成|未完成|缺交|还差|还有谁")
 _COMPLETED_INTENT = re.compile(r"谁(?:已经|已)?(?:交了|完成)|已交(?:人员|名单)?|完成人员")
 _MAKEUP_DECLARATION = re.compile(r"补(?:打卡|交|卡)")
@@ -403,6 +411,111 @@ class GroupSummaryService:
             f"{label} 迭代状态：\n"
             f"待迭代（{len(pending)}人）：{self._names(pending)}\n"
             f"已迭代（{len(completed)}人）：{self._names(completed)}"
+        )
+
+    def _leader_override_request(self, question: str) -> Optional[Tuple[str, str]]:
+        """解析“成员名已完成/已补交/未提交”这类组长代改命令。"""
+        status_match = _LEADER_OVERRIDE_STATUS.search(question)
+        if status_match is None:
+            return None
+        prefix = question[: status_match.start()].strip()
+        if not prefix:
+            return None
+        candidates: List[str] = []
+        for name in sorted(self.settings.report_members, key=len, reverse=True):
+            if name == "，":
+                compact = prefix.lstrip("帮把将 ")
+                if compact.startswith("@，") or compact.startswith("，"):
+                    candidates.append(name)
+            elif name in prefix:
+                candidates.append(name)
+        if len(candidates) != 1:
+            return None
+        raw_status = status_match.group("status")
+        if raw_status in {"未提交", "没交", "未完成"}:
+            status = "missing"
+        elif "补" in raw_status:
+            status = "late"
+        else:
+            status = "completed"
+        return candidates[0], status
+
+    def _answer_table_link(self) -> str:
+        if not self.settings.report_link:
+            return "本群还没有配置打卡表链接。"
+        return f"本群打卡表：{self.settings.report_link}"
+
+    def _answer_leader_attendance_override(
+        self,
+        *,
+        target_name: str,
+        status: str,
+        question: str,
+        reference_day: date,
+        message: StoredMessage,
+    ) -> str:
+        if message.sender_open_id not in self.settings.leader_member_ids:
+            return "只有本群已配置的组长可以代替其他成员修改作业状态。"
+        if not self.settings.base_sync_enabled:
+            return "本群尚未启用多维表格同步，暂时不能修改作业状态。"
+
+        requested_day = self._query_report_date(question, reference_day)
+        report_date = self.settings.assignment_report_date(requested_day)
+        self.sync_attendance_date(report_date, message.chat_id)
+        records = self.api.list_base_records(
+            self.settings.base_token,
+            self.settings.base_table_id,
+        )
+        key_prefix = f"{report_date}|"
+        record = next(
+            (
+                item
+                for item in records
+                if str((item.get("fields") or {}).get("记录键") or "").startswith(key_prefix)
+                and self._base_cell_text((item.get("fields") or {}).get("组员姓名")) == target_name
+            ),
+            None,
+        )
+        if record is None or not record.get("record_id"):
+            return (
+                f"没有找到{target_name}在{self._assignment_period_label(report_date)}的表格记录。"
+            )
+
+        manual_values = {
+            "completed": "正常提交",
+            "late": "补卡",
+            "missing": "未提交",
+        }
+        manual_value = manual_values[status]
+        self.api.update_base_record(
+            self.settings.base_token,
+            self.settings.base_table_id,
+            str(record["record_id"]),
+            {"人工状态": manual_value},
+        )
+        member_key = next(
+            (
+                open_id
+                for open_id, name in self.settings.member_aliases.items()
+                if name == target_name
+            ),
+            f"name:{target_name}",
+        )
+        self.store.add_attendance_override(
+            message_id=message.message_id,
+            report_date=report_date,
+            member_key=member_key,
+            member_name=target_name,
+            status=status,
+            actor_open_id=message.sender_open_id,
+            actor_name=message.sender_name,
+            event_time_ms=message.create_time_ms,
+        )
+        self.sync_attendance_date(report_date, message.chat_id)
+        return (
+            f"已由组长{message.sender_name}把{target_name}的"
+            f"{self._assignment_period_label(report_date)}标记为{manual_value}。\n"
+            "数据库和多维表格已同步。"
         )
 
     def _answer_stats_question(
@@ -1726,6 +1839,29 @@ class GroupSummaryService:
                     )
             self._maybe_react_to_homework(stored, report_dates, submitted_at)
         if mentioned_query is not None and self.settings.send_enabled:
+            if _TABLE_LINK_INTENT.search(mentioned_query):
+                self.api.reply_text(
+                    message.message_id,
+                    self._answer_table_link(),
+                    f"table-link-{message.message_id}",
+                )
+                return True
+            leader_override = self._leader_override_request(mentioned_query)
+            if leader_override is not None:
+                target_name, status = leader_override
+                reply = self._answer_leader_attendance_override(
+                    target_name=target_name,
+                    status=status,
+                    question=mentioned_query,
+                    reference_day=submitted_at.date(),
+                    message=stored,
+                )
+                self.api.reply_text(
+                    message.message_id,
+                    reply,
+                    f"leader-override-{message.message_id}",
+                )
+                return True
             if self._is_makeup_verification_request(mentioned_query):
                 reply = self._answer_self_makeup_verification(
                     mentioned_query,

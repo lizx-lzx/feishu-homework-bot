@@ -69,6 +69,10 @@ class FakeApi:
 
     def update_base_record(self, base_token, table_id, record_id, fields):
         self.base_updates.append((record_id, dict(fields)))
+        for record in self.base_records:
+            if record["record_id"] == record_id:
+                record["fields"].update(fields)
+                break
 
 
 class MemberLookupFailingApi(FakeApi):
@@ -373,6 +377,164 @@ def test_bot_mention_can_list_completed_members(tmp_path):
     assert api.replies[-1][1] == (
         "8月11日前置作业已提交 1/2。\n正常提交（1人）：小李\n已补交（0人）：无"
     )
+
+
+def test_bot_mention_returns_group_table_link(tmp_path):
+    _, api, _, _, service = make_service(tmp_path)
+
+    assert service.handle_message(incoming("om_table", "@知识库助手 打开打卡表")) is True
+
+    assert api.replies == [
+        (
+            "om_table",
+            "本群打卡表：https://example.com/base",
+            "table-link-om_table",
+        )
+    ]
+
+
+def test_group_leader_can_mark_another_member_completed(tmp_path):
+    original = make_settings(tmp_path)
+    settings = replace(
+        original,
+        assignment_cycle_start_date="2026-08-17",
+        assignment_cycle_days=2,
+        assignment_publish_hour=10,
+        assignment_due_hour=20,
+        base_sync_enabled=True,
+        base_token="bas_test",
+        base_table_id="tbl_test",
+        report_members=("组长", "Arina", "普通成员"),
+        member_aliases={"ou_leader": "组长", "ou_arina": "Arina", "ou_member": "普通成员"},
+        leader_member_ids=("ou_leader",),
+    )
+    api = FakeApi()
+    store = LocalStore(settings.db_path)
+    service = GroupSummaryService(settings, api, FakeSummarizer(), store)
+    service.handle_message(
+        incoming(
+            "om_third_assignment",
+            "#8月21日 第3次作业已完成\n作业说明：已完成部署",
+            sender_open_id="ou_member",
+            created_at=datetime(2026, 8, 22, 13, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+    )
+
+    assert (
+        service.handle_message(
+            incoming(
+                "om_leader_override",
+                "@知识库助手 Arina已完成",
+                sender_open_id="ou_leader",
+                created_at=datetime(2026, 8, 22, 19, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+            )
+        )
+        is True
+    )
+
+    attendance = {
+        record.sender_name: record for record in store.list_daily_attendance("2026-08-21")
+    }
+    assert attendance["Arina"].homework_status == "completed"
+    arina_record = next(
+        record for record in api.base_records if record["fields"]["组员姓名"] == "Arina"
+    )
+    assert arina_record["fields"]["人工状态"] == "正常提交"
+    assert api.replies[-1][1] == (
+        "已由组长组长把Arina的第3次作业（8月21日—8月22日）标记为正常提交。\n"
+        "数据库和多维表格已同步。"
+    )
+    assert store.list_attendance_overrides("2026-08-21") == [
+        {
+            "message_id": "om_leader_override",
+            "report_date": "2026-08-21",
+            "member_key": "ou_arina",
+            "member_name": "Arina",
+            "status": "completed",
+            "actor_open_id": "ou_leader",
+            "actor_name": "组长",
+            "event_time_ms": int(
+                datetime(2026, 8, 22, 19, 0, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp() * 1000
+            ),
+        }
+    ]
+
+
+def test_group_leader_can_mark_historical_assignment_late(tmp_path):
+    original = make_settings(tmp_path)
+    settings = replace(
+        original,
+        assignment_cycle_start_date="2026-08-17",
+        assignment_cycle_days=2,
+        assignment_publish_hour=10,
+        assignment_due_hour=20,
+        base_sync_enabled=True,
+        base_token="bas_test",
+        base_table_id="tbl_test",
+        report_members=("组长", "Arina"),
+        member_aliases={"ou_leader": "组长", "ou_arina": "Arina"},
+        leader_member_ids=("ou_leader",),
+    )
+    api = FakeApi()
+    store = LocalStore(settings.db_path)
+    service = GroupSummaryService(settings, api, FakeSummarizer(), store)
+    service.handle_message(
+        incoming(
+            "om_second_cycle_seed",
+            "第2次作业发布",
+            sender_open_id="ou_leader",
+            created_at=datetime(2026, 8, 19, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+    )
+
+    service.handle_message(
+        incoming(
+            "om_historical_late",
+            "@知识库助手 Arina第2次作业已补交",
+            sender_open_id="ou_leader",
+            created_at=datetime(2026, 8, 22, 19, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+    )
+
+    attendance = {
+        record.sender_name: record for record in store.list_daily_attendance("2026-08-19")
+    }
+    assert attendance["Arina"].homework_status == "late"
+    assert "第2次作业（8月19日—8月20日）标记为补卡" in api.replies[-1][1]
+
+
+def test_non_leader_cannot_override_another_member(tmp_path):
+    original = make_settings(tmp_path)
+    settings = replace(
+        original,
+        base_sync_enabled=True,
+        base_token="bas_test",
+        base_table_id="tbl_test",
+        report_members=("组长", "Arina", "普通成员"),
+        member_aliases={"ou_leader": "组长", "ou_arina": "Arina", "ou_member": "普通成员"},
+        leader_member_ids=("ou_leader",),
+    )
+    api = FakeApi()
+    store = LocalStore(settings.db_path)
+    service = GroupSummaryService(settings, api, FakeSummarizer(), store)
+
+    service.handle_message(
+        incoming(
+            "om_denied_override",
+            "@知识库助手 Arina已完成",
+            sender_open_id="ou_member",
+        )
+    )
+
+    assert api.replies[-1][1] == "只有本群已配置的组长可以代替其他成员修改作业状态。"
+    assert api.base_updates == []
+    assert store.list_attendance_overrides("2026-08-11") == []
+
+
+def test_status_question_is_not_parsed_as_leader_override(tmp_path):
+    _, _, _, _, service = make_service(tmp_path)
+
+    assert service._leader_override_request("Arina完成了吗？") is None
 
 
 def test_bot_mention_resolves_chinese_assignment_number_instead_of_current_cycle(
@@ -1321,8 +1483,7 @@ def test_two_day_cycle_accepts_assignment_label_without_ci(tmp_path):
     service.sync_attendance_date("2026-08-21", "oc_group")
 
     attendance = {
-        record.sender_name: record
-        for record in store.list_daily_attendance("2026-08-21")
+        record.sender_name: record for record in store.list_daily_attendance("2026-08-21")
     }
     assert attendance["Arina"].assignment_label == "第3次作业"
     assert attendance["Arina"].homework_status == "completed"
@@ -1890,6 +2051,7 @@ def test_group_router_applies_independent_profile_without_enabling_sends(tmp_pat
                 "report_title": "24组日报",
                 "report_members": ["李"],
                 "member_aliases": {"ou_li": "李"},
+                "leader_member_ids": ["ou_leader"],
                 "additional_excluded_member_ids": ["ou_manager"],
                 "send_enabled": False,
                 "base_sync_enabled": True,
@@ -1910,6 +2072,7 @@ def test_group_router_applies_independent_profile_without_enabling_sends(tmp_pat
     assert service_24 is not None
     assert service_27.settings.member_aliases["ou_1"] == "小李"
     assert service_24.settings.member_aliases == {"ou_li": "李"}
+    assert service_24.settings.leader_member_ids == ("ou_leader",)
     assert service_24.settings.report_members == ("李",)
     assert service_24.settings.send_enabled is False
     assert service_24.settings.base_sync_enabled is True

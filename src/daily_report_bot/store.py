@@ -139,6 +139,19 @@ class LocalStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_homework_verifications_date
                     ON homework_verifications(report_date, evidence_time_ms);
+                CREATE TABLE IF NOT EXISTS attendance_overrides (
+                    message_id TEXT PRIMARY KEY,
+                    report_date TEXT NOT NULL,
+                    member_key TEXT NOT NULL,
+                    member_name TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    actor_open_id TEXT NOT NULL,
+                    actor_name TEXT NOT NULL,
+                    event_time_ms INTEGER NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS idx_attendance_overrides_date_member
+                    ON attendance_overrides(report_date, member_key, event_time_ms);
                 CREATE TABLE IF NOT EXISTS homework_reactions (
                     message_id TEXT PRIMARY KEY,
                     report_date TEXT NOT NULL,
@@ -559,6 +572,56 @@ class LocalStore:
             }
             for row in rows
         ]
+
+    def add_attendance_override(
+        self,
+        *,
+        message_id: str,
+        report_date: str,
+        member_key: str,
+        member_name: str,
+        status: str,
+        actor_open_id: str,
+        actor_name: str,
+        event_time_ms: int,
+    ) -> bool:
+        """记录组长通过群命令修改作业状态的审计事件。"""
+        if status not in {"completed", "late", "missing"}:
+            raise ValueError("组长代改状态只能是 completed、late 或 missing")
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT OR IGNORE INTO attendance_overrides(
+                    message_id, report_date, member_key, member_name, status,
+                    actor_open_id, actor_name, event_time_ms
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    message_id,
+                    report_date,
+                    member_key,
+                    member_name,
+                    status,
+                    actor_open_id,
+                    actor_name,
+                    event_time_ms,
+                ),
+            )
+        return cursor.rowcount == 1
+
+    def list_attendance_overrides(self, report_date: str) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT message_id, report_date, member_key, member_name, status,
+                       actor_open_id, actor_name, event_time_ms
+                FROM attendance_overrides
+                WHERE report_date = ?
+                ORDER BY event_time_ms ASC
+                """,
+                (report_date,),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def homework_reaction_sent(self, message_id: str) -> bool:
         with self._connect() as conn:

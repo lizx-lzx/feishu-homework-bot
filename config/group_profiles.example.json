@@ -10,6 +10,7 @@
       "飞书用户1234AB": "A同学"
     },
     "excluded_member_ids": ["ou_non_member"],
+    "leader_member_ids": ["ou_group_leader"],
     "send_enabled": true,
     "homework_reaction_enabled": true,
     "base_sync_enabled": true,
