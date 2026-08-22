@@ -1,0 +1,238 @@
+{
+  "schema_version": 1,
+  "table": {
+    "name": "作业打卡记录",
+    "primary_field": "记录键",
+    "description": "每个群使用一张独立数据表，每人每个作业周期一条记录。"
+  },
+  "fields": [
+    {
+      "name": "记录键",
+      "type": "text",
+      "description": "主字段；由作业周期日期与成员稳定标识组成，用于幂等写入。",
+      "managed_by": "bot"
+    },
+    {
+      "name": "日期",
+      "type": "datetime",
+      "style": {"format": "yyyy-MM-dd"},
+      "description": "作业周期的首日，不用 Today/Yesterday 相对筛选。",
+      "managed_by": "bot"
+    },
+    {
+      "name": "作业序号",
+      "type": "number",
+      "style": {"type": "plain", "precision": 0},
+      "description": "从课程起始日计算的第几次作业。",
+      "managed_by": "bot"
+    },
+    {
+      "name": "作业周期",
+      "type": "text",
+      "description": "可读周期标签，例如“第 2 次作业（2026-08-19—2026-08-20）”。",
+      "managed_by": "bot"
+    },
+    {
+      "name": "周期状态",
+      "type": "select",
+      "multiple": false,
+      "options": [
+        {"name": "当前周期", "hue": "Green", "lightness": "Light"},
+        {"name": "历史周期", "hue": "Gray", "lightness": "Lighter"}
+      ],
+      "description": "机器人在周期切换时自动更新，所有当期视图均以此筛选。",
+      "managed_by": "bot"
+    },
+    {
+      "name": "作业名称",
+      "type": "text",
+      "description": "例如“第二次作业”。",
+      "managed_by": "bot"
+    },
+    {
+      "name": "组员姓名",
+      "type": "text",
+      "description": "群内对外展示的脱敏昵称。",
+      "managed_by": "bot"
+    },
+    {
+      "name": "飞书OpenID",
+      "type": "text",
+      "description": "稳定识别成员的技术字段；不应出现在公开截图或导出数据中。",
+      "managed_by": "bot"
+    },
+    {
+      "name": "人工状态",
+      "type": "select",
+      "multiple": false,
+      "options": [
+        {"name": "正常提交", "hue": "Green", "lightness": "Light"},
+        {"name": "补卡", "hue": "Orange", "lightness": "Light"},
+        {"name": "未提交", "hue": "Red", "lightness": "Light"},
+        {"name": "不参与统计", "hue": "Gray", "lightness": "Lighter"}
+      ],
+      "description": "由组长手动维护；空值表示使用机器人判定。机器人不覆盖此列。",
+      "managed_by": "leader"
+    },
+    {
+      "name": "作业状态",
+      "type": "select",
+      "multiple": false,
+      "options": [
+        {"name": "已提交", "hue": "Green", "lightness": "Light"},
+        {"name": "补卡", "hue": "Orange", "lightness": "Light"},
+        {"name": "未提交", "hue": "Red", "lightness": "Light"}
+      ],
+      "description": "合并机器人识别与人工状态后的有效作业状态。",
+      "managed_by": "bot"
+    },
+    {
+      "name": "复盘状态",
+      "type": "select",
+      "multiple": false,
+      "options": [
+        {"name": "已复盘", "hue": "Green", "lightness": "Light"},
+        {"name": "未复盘", "hue": "Red", "lightness": "Light"}
+      ],
+      "description": "当期是否存在符合规则的复盘证据。",
+      "managed_by": "bot"
+    },
+    {
+      "name": "迭代状态",
+      "type": "select",
+      "multiple": false,
+      "options": [
+        {"name": "待迭代", "hue": "Orange", "lightness": "Light"},
+        {"name": "已迭代", "hue": "Green", "lightness": "Light"},
+        {"name": "无需迭代", "hue": "Gray", "lightness": "Lighter"}
+      ],
+      "description": "组长发起迭代后由机器人跟踪。",
+      "managed_by": "bot"
+    },
+    {
+      "name": "迭代发起人",
+      "type": "text",
+      "description": "发起迭代的群成员昵称。",
+      "managed_by": "bot"
+    },
+    {
+      "name": "提交时间",
+      "type": "datetime",
+      "style": {"format": "yyyy-MM-dd HH:mm"},
+      "description": "作业证据消息的实际提交时间。",
+      "managed_by": "bot"
+    },
+    {
+      "name": "复盘时间",
+      "type": "datetime",
+      "style": {"format": "yyyy-MM-dd HH:mm"},
+      "description": "复盘证据消息的实际时间。",
+      "managed_by": "bot"
+    },
+    {
+      "name": "迭代时间",
+      "type": "datetime",
+      "style": {"format": "yyyy-MM-dd HH:mm"},
+      "description": "最近一次迭代状态更新时间。",
+      "managed_by": "bot"
+    },
+    {
+      "name": "作业证据消息ID",
+      "type": "text",
+      "description": "用于回查原始作业消息，多条时以顿号分隔。",
+      "managed_by": "bot"
+    },
+    {
+      "name": "复盘证据消息ID",
+      "type": "text",
+      "description": "用于回查原始复盘消息，多条时以顿号分隔。",
+      "managed_by": "bot"
+    },
+    {
+      "name": "正常提交累计",
+      "type": "number",
+      "style": {"type": "plain", "precision": 0},
+      "description": "截至当期的正常提交次数。",
+      "managed_by": "bot"
+    },
+    {
+      "name": "补卡累计",
+      "type": "number",
+      "style": {"type": "plain", "precision": 0},
+      "description": "截至当期的补卡次数。",
+      "managed_by": "bot"
+    },
+    {
+      "name": "旷卡累计",
+      "type": "number",
+      "style": {"type": "plain", "precision": 0},
+      "description": "截至当期的未提交次数。",
+      "managed_by": "bot"
+    },
+    {
+      "name": "最后同步时间",
+      "type": "datetime",
+      "style": {"format": "yyyy-MM-dd HH:mm"},
+      "description": "最近一次机器人写入这条记录的时间。",
+      "managed_by": "bot"
+    }
+  ],
+  "views": [
+    {
+      "name": "当前作业周期",
+      "type": "grid",
+      "filter": {"logic": "and", "conditions": [["周期状态", "intersects", ["当前周期"]]]},
+      "sort": {"sort_config": [{"field": "组员姓名", "desc": false}]},
+      "visible_fields": ["组员姓名", "人工状态", "作业状态", "复盘状态", "迭代状态", "提交时间", "复盘时间", "正常提交累计", "补卡累计", "旷卡累计", "作业周期"]
+    },
+    {
+      "name": "本周期已提交",
+      "type": "grid",
+      "filter": {"logic": "and", "conditions": [["周期状态", "intersects", ["当前周期"]], ["作业状态", "intersects", ["已提交", "补卡"]], ["人工状态", "disjoint", ["不参与统计"]]]},
+      "sort": {"sort_config": [{"field": "提交时间", "desc": false}]},
+      "visible_fields": ["组员姓名", "作业状态", "提交时间", "复盘状态", "人工状态", "作业周期"]
+    },
+    {
+      "name": "本周期待提交",
+      "type": "grid",
+      "filter": {"logic": "and", "conditions": [["周期状态", "intersects", ["当前周期"]], ["作业状态", "intersects", ["未提交"]], ["人工状态", "disjoint", ["不参与统计"]]]},
+      "sort": {"sort_config": [{"field": "组员姓名", "desc": false}]},
+      "visible_fields": ["组员姓名", "人工状态", "作业状态", "复盘状态", "作业周期"]
+    },
+    {
+      "name": "补卡成员",
+      "type": "grid",
+      "filter": {"logic": "and", "conditions": [["周期状态", "intersects", ["当前周期"]], ["作业状态", "intersects", ["补卡"]], ["人工状态", "disjoint", ["不参与统计"]]]},
+      "sort": {"sort_config": [{"field": "提交时间", "desc": false}]},
+      "visible_fields": ["组员姓名", "提交时间", "人工状态", "补卡累计", "作业周期"]
+    },
+    {
+      "name": "本周期已复盘",
+      "type": "grid",
+      "filter": {"logic": "and", "conditions": [["周期状态", "intersects", ["当前周期"]], ["复盘状态", "intersects", ["已复盘"]], ["人工状态", "disjoint", ["不参与统计"]]]},
+      "sort": {"sort_config": [{"field": "复盘时间", "desc": false}]},
+      "visible_fields": ["组员姓名", "复盘状态", "复盘时间", "作业状态", "人工状态", "作业周期"]
+    },
+    {
+      "name": "待迭代",
+      "type": "grid",
+      "filter": {"logic": "and", "conditions": [["周期状态", "intersects", ["当前周期"]], ["迭代状态", "intersects", ["待迭代"]], ["人工状态", "disjoint", ["不参与统计"]]]},
+      "sort": {"sort_config": [{"field": "组员姓名", "desc": false}]},
+      "visible_fields": ["组员姓名", "迭代状态", "迭代发起人", "迭代时间", "作业状态", "作业周期"]
+    },
+    {
+      "name": "已迭代",
+      "type": "grid",
+      "filter": {"logic": "and", "conditions": [["周期状态", "intersects", ["当前周期"]], ["迭代状态", "intersects", ["已迭代"]], ["人工状态", "disjoint", ["不参与统计"]]]},
+      "sort": {"sort_config": [{"field": "迭代时间", "desc": true}]},
+      "visible_fields": ["组员姓名", "迭代状态", "迭代发起人", "迭代时间", "作业状态", "作业周期"]
+    }
+  ],
+  "manual_override": {
+    "field": "人工状态",
+    "empty_means": "使用机器人判定",
+    "precedence": "人工状态高于机器人判定",
+    "excluded_value": "不参与统计",
+    "excluded_behavior": "不进入分母、未交名单、催交、群日报和状态视图，但保留在当前作业周期视图中便于组长恢复。"
+  }
+}

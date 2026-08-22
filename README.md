@@ -50,6 +50,16 @@
 20:00 补交汇总机制；仅成员名单、消息库、发送幂等
 记录和多维表格相互独立。
 
+## 多维表格模板
+
+仓库已开源可从零复建的脱敏表格设计：
+
+- [`config/base_schema.example.json`](config/base_schema.example.json)：22 个字段、7 个视图、单选选项、筛选、排序和可见字段的机读 Schema。
+- [`docs/多维表格设计.md`](docs/多维表格设计.md)：数据分区、人工状态优先级、精确视图规则和从零复建步骤。
+- `python3 scripts/validate_base_schema.py`：校验字段、视图和所有引用的一致性。
+
+真实 Base Token、Table ID、群 ID、成员 OpenID 和打卡记录不进入开源仓库。
+
 ## 本地运行
 
 ```bash

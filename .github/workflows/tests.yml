@@ -14,5 +14,6 @@ jobs:
           python-version: "3.11"
           cache: pip
       - run: pip install -e '.[dev]'
-      - run: ruff check src tests
+      - run: ruff check src tests scripts
+      - run: python3 scripts/validate_base_schema.py
       - run: pytest -q
