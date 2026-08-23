@@ -184,6 +184,121 @@ def test_minimax_rejects_unlisted_target_from_command_interpretation():
     assert summarizer.interpret_leader_override("他已经交了", ("卫安", "米粒")) is None
 
 
+def test_minimax_interprets_natural_attendance_query_as_strict_json():
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        assert "受限查询解析器" in payload["messages"][0]["content"]
+        assert "第三次还有哪些人掉队了" in payload["messages"][1]["content"]
+        assert payload["max_completion_tokens"] == 500
+        assert payload["temperature"] == 0.0
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                "```json\n"
+                                '{"intent":"attendance_query","topic":"homework",'
+                                '"mode":"missing","assignment_number":3,'
+                                '"target":null,"confidence":0.96}'
+                                "\n```"
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+
+    summarizer = Summarizer(
+        "https://api.minimaxi.com/v1",
+        "secret",
+        "MiniMax-M3",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    assert summarizer.interpret_query(
+        "第三次还有哪些人掉队了",
+        ("卫安", "米粒", "，"),
+    ) == {
+        "intent": "attendance_query",
+        "topic": "homework",
+        "mode": "missing",
+        "assignment_number": 3,
+        "target": None,
+        "confidence": 0.96,
+    }
+
+
+def test_minimax_rejects_unlisted_member_history_target():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                '{"intent":"member_history","topic":"homework",'
+                                '"mode":"summary","assignment_number":null,'
+                                '"target":"陌生人","confidence":0.99}'
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+
+    summarizer = Summarizer(
+        "https://api.minimaxi.com/v1",
+        "secret",
+        "MiniMax-M3",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    assert summarizer.interpret_query("帮我查查他的所有记录", ("卫安", "米粒")) is None
+
+
+def test_minimax_homework_feedback_requires_three_fixed_lines():
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        assert "作业助教" in payload["messages"][0]["content"]
+        assert "会员页面" in payload["messages"][1]["content"]
+        assert payload["max_completion_tokens"] == 800
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                "亮点：已完成公网部署并写清了卡点。\n"
+                                "可继续打磨：可补充关键实现选择的原因。\n"
+                                "下一步：加一次外部设备访问验收。"
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+
+    summarizer = Summarizer(
+        "https://api.minimaxi.com/v1",
+        "secret",
+        "MiniMax-M3",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    result = summarizer.feedback_homework(
+        "小李",
+        "我做了会员页面，完成部署后发现外网访问有卡点。",
+    )
+
+    assert result.count("\n") == 2
+    assert result.startswith("亮点：")
+    assert "\n下一步：" in result
+
+
 def test_minimax_m3_normalizes_review_count_placeholder_from_fixed_facts():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(

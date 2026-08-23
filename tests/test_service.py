@@ -106,6 +106,34 @@ class FakeSemanticSummarizer(FakeSummarizer):
         }
 
 
+class FakeSemanticQuerySummarizer(FakeSummarizer):
+    def interpret_query(self, command, roster):
+        assert command == "第一次还有哪些人掉队了"
+        assert tuple(roster) == ("小李", "小王")
+        return {
+            "intent": "attendance_query",
+            "topic": "homework",
+            "mode": "missing",
+            "assignment_number": 1,
+            "target": None,
+            "confidence": 0.96,
+        }
+
+
+class FakeFeedbackSummarizer(FakeSummarizer):
+    def __init__(self):
+        super().__init__()
+        self.feedback_calls = []
+
+    def feedback_homework(self, member_name, homework_text):
+        self.feedback_calls.append((member_name, homework_text))
+        return (
+            "亮点：写清了交付成果和遇到的卡点。\n"
+            "可继续打磨：可补充关键取舍的原因。\n"
+            "下一步：用另一台设备验证公网链接。"
+        )
+
+
 def test_transcript_normalizes_known_feishu_display_names():
     message = StoredMessage(
         message_id="om_alias",
@@ -403,6 +431,129 @@ def test_bot_mention_returns_group_table_link(tmp_path):
             "table-link-om_table",
         )
     ]
+
+
+def test_bot_menu_and_numeric_my_stats_shortcut(tmp_path):
+    _, api, _, _, service = make_service(tmp_path)
+    service.handle_message(incoming("om_done", "#0811前置作业已完成"))
+
+    assert service.handle_message(incoming("om_menu", "@知识库助手 菜单")) is True
+    assert "🎮 作业助教菜单" in api.replies[-1][1]
+    assert "3  我的战绩" in api.replies[-1][1]
+
+    assert service.handle_message(incoming("om_my_stats", "@知识库助手 3")) is True
+    reply = api.replies[-1][1]
+    assert reply.startswith("🎮 小李・我的战绩")
+    assert "累计：正常 1 次｜补卡 0 次｜未交 0 次" in reply
+    assert "最近一次：✅ 正常提交｜❌ 未复盘" in reply
+
+
+def test_bot_uses_constrained_semantic_query_for_natural_wording(tmp_path):
+    original = make_settings(tmp_path)
+    settings = replace(
+        original,
+        assignment_cycle_start_date="2026-08-17",
+        assignment_cycle_days=2,
+        assignment_publish_hour=10,
+        assignment_due_hour=20,
+    )
+    api = FakeApi()
+    store = LocalStore(settings.db_path)
+    service = GroupSummaryService(settings, api, FakeSemanticQuerySummarizer(), store)
+    service.handle_message(
+        incoming(
+            "om_assignment_one",
+            "#8月17日 第1次作业已完成\n作业说明：已完成部署",
+            created_at=datetime(2026, 8, 17, 12, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+    )
+
+    assert (
+        service.handle_message(
+            incoming(
+                "om_semantic_query",
+                "@知识库助手 第一次还有哪些人掉队了",
+                created_at=datetime(2026, 8, 18, 18, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+            )
+        )
+        is True
+    )
+
+    reply = api.replies[-1][1]
+    assert "第1次作业已提交 1/2" in reply
+    assert "仍未交（1人）：小王" in reply
+
+
+def test_homework_feedback_is_opt_in_and_idempotent(tmp_path):
+    settings = make_settings(tmp_path)
+    api = FakeApi()
+    summarizer = FakeFeedbackSummarizer()
+    store = LocalStore(settings.db_path)
+    service = GroupSummaryService(settings, api, summarizer, store)
+    message = incoming(
+        "om_feedback",
+        "@知识库助手 #0811前置作业已完成\n"
+        "作业说明：我完成了公网部署，也记录了别人无法访问时的排查过程。\n"
+        "#求反馈",
+    )
+
+    assert service.handle_message(message) is True
+    assert service.handle_message(message) is False
+
+    assert len(summarizer.feedback_calls) == 1
+    assert summarizer.feedback_calls[0][0] == "小李"
+    assert "#求反馈" not in summarizer.feedback_calls[0][1]
+    assert len(api.replies) == 1
+    assert api.replies[0][1].startswith("亮点：")
+    assert api.replies[0][2] == "homework-feedback-om_feedback"
+
+
+def test_short_homework_feedback_request_does_not_call_model(tmp_path):
+    settings = make_settings(tmp_path)
+    api = FakeApi()
+    summarizer = FakeFeedbackSummarizer()
+    store = LocalStore(settings.db_path)
+    service = GroupSummaryService(settings, api, summarizer, store)
+
+    service.handle_message(incoming("om_short_feedback", "#0811作业已完成 #求反馈"))
+
+    assert summarizer.feedback_calls == []
+    assert "补充作业说明、收获或卡点" in api.replies[-1][1]
+
+
+def test_weekly_growth_card_is_generated_only_on_demand(tmp_path):
+    original = make_settings(tmp_path)
+    settings = replace(
+        original,
+        assignment_cycle_start_date="2026-08-17",
+        assignment_cycle_days=2,
+        assignment_publish_hour=10,
+        assignment_due_hour=20,
+    )
+    api = FakeApi()
+    store = LocalStore(settings.db_path)
+    service = GroupSummaryService(settings, api, FakeSummarizer(), store)
+    service.handle_message(
+        incoming(
+            "om_growth_done",
+            "#8月17日 第1次作业已完成\n作业说明：已完成页面",
+            created_at=datetime(2026, 8, 17, 12, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+    )
+    assert api.replies == []
+
+    service.handle_message(
+        incoming(
+            "om_growth_query",
+            "@知识库助手 5",
+            created_at=datetime(2026, 8, 18, 18, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+    )
+
+    reply = api.replies[-1][1]
+    assert reply.startswith("🌟 本周成长卡")
+    assert "作业完成：1/2" in reply
+    assert "🎯 全部准时：小李" in reply
 
 
 def test_group_leader_can_mark_another_member_completed(tmp_path):

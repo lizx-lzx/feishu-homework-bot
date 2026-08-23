@@ -65,6 +65,18 @@ _TABLE_LINK_INTENT = re.compile(
     r"(?:打开|查看|唤出|调出|发给我|给我).{0,8}(?:打卡表|表格)"
     r"|(?:打卡表|表格).{0,8}(?:链接|在哪|打开|查看)"
 )
+_MENU_INTENT = re.compile(r"^(?:菜单|帮助|功能|怎么玩|能做什么|使用说明)$")
+_MY_STATS_INTENT = re.compile(r"我的战绩|我的打卡|我的作业|我还差什么|我还差啥|我这次.*(?:交|完成)")
+_WEEKLY_GROWTH_INTENT = re.compile(r"本周成长|成长卡|本周战报")
+_FEEDBACK_REQUEST = re.compile(r"#\s*求反馈")
+_MENU_SHORTCUTS = {
+    "1": "本次作业情况",
+    "2": "本次作业谁还没交",
+    "3": "我的战绩",
+    "4": "本次作业补卡情况",
+    "5": "本周成长卡",
+    "6": "打开打卡表",
+}
 _LEADER_OVERRIDE_STATUS = re.compile(
     r"(?P<status>未提交|没交|未完成|已完成补提交|已完成补交|已完成补卡|"
     r"已补提交|补提交|已补交|补交|"
@@ -489,6 +501,239 @@ class GroupSummaryService:
         if not self.settings.report_link:
             return "本群还没有配置打卡表链接。"
         return f"本群打卡表：{self.settings.report_link}"
+
+    @staticmethod
+    def _answer_menu() -> str:
+        return (
+            "🎮 作业助教菜单\n\n"
+            "@ 我后发送数字即可：\n"
+            "1  本次作业进度\n"
+            "2  谁还没交\n"
+            "3  我的战绩\n"
+            "4  补卡情况\n"
+            "5  本周成长卡\n"
+            "6  打开打卡表\n\n"
+            "也可直接说：“第三次还有谁掉队了”。\n"
+            "交作业时加 #求反馈，我会根据文字给三行点评。"
+        )
+
+    def _answer_my_stats(self, message: StoredMessage, reference_day: date) -> str:
+        member_name = message.sender_name
+        if member_name not in self.settings.report_members:
+            return "你不在本群的打卡名单中，暂时没有个人战绩。"
+        current_report_date = self.settings.assignment_report_date(reference_day)
+        try:
+            self.sync_attendance_date(current_report_date, message.chat_id)
+        except Exception:
+            logger.exception("查询个人战绩前刷新打卡状态失败")
+        records = [
+            record
+            for record in self.store.list_member_attendance(
+                message.sender_open_id,
+                member_name,
+                reference_day.isoformat(),
+            )
+            if record.homework_status != "excluded"
+        ]
+        if not records:
+            return f"{member_name}还没有可查询的打卡记录。"
+
+        normal = sum(record.homework_status == "completed" for record in records)
+        late = sum(record.homework_status == "late" for record in records)
+        missing = sum(record.homework_status == "missing" for record in records)
+        reviewed = sum(record.review_status == "completed" for record in records)
+        normal_streak = 0
+        for record in reversed(records):
+            if record.homework_status != "completed":
+                break
+            normal_streak += 1
+        current = next(
+            (record for record in reversed(records) if record.report_date == current_report_date),
+            records[-1],
+        )
+        status_label = {
+            "completed": "✅ 正常提交",
+            "late": "🟡 补卡",
+            "missing": "❌ 未提交",
+        }.get(current.homework_status, current.homework_status)
+        review_label = "✅ 已复盘" if current.review_status == "completed" else "❌ 未复盘"
+        badges: List[str] = []
+        if normal >= 3:
+            badges.append("🎯 稳定交付")
+        if normal_streak >= 3:
+            badges.append("🔥 连续准时")
+        if reviewed >= 3:
+            badges.append("📝 复盘连击")
+        if late:
+            badges.append("🟡 补卡归队")
+        return (
+            f"🎮 {member_name}・我的战绩\n\n"
+            f"累计：正常 {normal} 次｜补卡 {late} 次｜未交 {missing} 次\n"
+            f"复盘：{reviewed}/{len(records)}｜连续正常提交 {normal_streak} 次\n\n"
+            f"最近一次：{status_label}｜{review_label}\n"
+            f"徽章：{self._names(badges)}"
+        )
+
+    def _answer_weekly_growth(self, reference_day: date, chat_id: str) -> str:
+        if not self.settings.assignment_cycle_start_date:
+            return "本群还没有配置作业周期，暂时无法生成成长卡。"
+        course_start = datetime.strptime(
+            self.settings.assignment_cycle_start_date,
+            "%Y-%m-%d",
+        ).date()
+        window_start = max(course_start, reference_day - timedelta(days=6))
+        cycle_day = datetime.strptime(
+            self.settings.assignment_report_date(window_start),
+            "%Y-%m-%d",
+        ).date()
+        current_cycle = datetime.strptime(
+            self.settings.assignment_report_date(reference_day),
+            "%Y-%m-%d",
+        ).date()
+        try:
+            self.sync_attendance_date(current_cycle.isoformat(), chat_id)
+        except Exception:
+            logger.exception("生成本周成长卡前刷新打卡状态失败")
+        cycles: List[Tuple[str, List[AttendanceRecord]]] = []
+        while cycle_day <= current_cycle:
+            report_date = cycle_day.isoformat()
+            records = self.store.list_daily_attendance(report_date)
+            if records:
+                cycles.append((report_date, records))
+            cycle_day += timedelta(days=self.settings.assignment_cycle_days)
+        if not cycles:
+            return "本周还没有可用的打卡数据。"
+
+        statuses: Dict[str, List[str]] = defaultdict(list)
+        reviews: Dict[str, List[str]] = defaultdict(list)
+        for _, records in cycles:
+            for record in records:
+                if (
+                    record.sender_name not in self.settings.report_members
+                    or record.homework_status == "excluded"
+                ):
+                    continue
+                statuses[record.sender_name].append(record.homework_status)
+                reviews[record.sender_name].append(record.review_status)
+        cycle_count = len(cycles)
+        on_time = [
+            name
+            for name in self.settings.report_members
+            if len(statuses[name]) == cycle_count
+            and all(status == "completed" for status in statuses[name])
+        ]
+        full_attendance = [
+            name
+            for name in self.settings.report_members
+            if len(statuses[name]) == cycle_count
+            and all(status in {"completed", "late"} for status in statuses[name])
+        ]
+        review_streak = [
+            name
+            for name in self.settings.report_members
+            if len(reviews[name]) == cycle_count
+            and all(status == "completed" for status in reviews[name])
+        ]
+        makeup_returned = [
+            name
+            for name in self.settings.report_members
+            if any(status == "late" for status in statuses[name])
+        ]
+        completed_count = sum(
+            status in {"completed", "late"} for values in statuses.values() for status in values
+        )
+        total = sum(len(values) for values in statuses.values())
+        start_day = datetime.strptime(cycles[0][0], "%Y-%m-%d").date()
+        end_day = datetime.strptime(cycles[-1][0], "%Y-%m-%d").date()
+        return (
+            "🌟 本周成长卡\n\n"
+            f"统计周期：{start_day.month}月{start_day.day}日—{end_day.month}月{end_day.day}日\n"
+            f"作业完成：{completed_count}/{total}\n\n"
+            f"🎯 全部准时：{self._names(on_time)}\n"
+            f"👣 本周全勤：{self._names(full_attendance)}\n"
+            f"📝 复盘连击：{self._names(review_streak)}\n"
+            f"🟡 补卡归队：{self._names(makeup_returned)}"
+        )
+
+    def _semantic_query_answer(
+        self,
+        question: str,
+        reference_day: date,
+        chat_id: str,
+    ) -> Optional[Tuple[str, bool]]:
+        interpreter = getattr(self.summarizer, "interpret_query", None)
+        if not callable(interpreter):
+            return None
+        try:
+            parsed = interpreter(question, self.settings.report_members)
+        except Exception:
+            logger.exception("MiniMax 统计查询语义解析失败")
+            return None
+        if not isinstance(parsed, dict):
+            return None
+        assignment_number = parsed.get("assignment_number")
+        if assignment_number is not None:
+            _, _, current_assignment = self.settings.assignment_cycle(reference_day)
+            if (
+                isinstance(assignment_number, bool)
+                or not isinstance(assignment_number, int)
+                or assignment_number < 1
+                or assignment_number > current_assignment
+            ):
+                return None
+        if parsed.get("intent") == "member_history":
+            target = parsed.get("target")
+            if target not in self.settings.report_members or target == "，":
+                return None
+            return self._answer_member_history(
+                f"查询{target}全部打卡记录",
+                reference_day,
+            ), True
+        if parsed.get("intent") != "attendance_query":
+            return None
+        prefix = f"第{assignment_number}次" if assignment_number else ""
+        topic = "复盘" if parsed.get("topic") == "review" else "作业"
+        mode = parsed.get("mode")
+        suffix = "谁没完成" if mode == "missing" else "谁完成了" if mode == "completed" else "情况"
+        answer = self._answer_stats_question(
+            f"{prefix}{topic}{suffix}",
+            reference_day,
+            chat_id,
+        )
+        return (answer, False) if answer is not None else None
+
+    def _maybe_answer_feedback(
+        self,
+        message: StoredMessage,
+        report_dates: Sequence[str],
+    ) -> bool:
+        if (
+            not self.settings.send_enabled
+            or not report_dates
+            or message.sender_name not in self.settings.report_members
+        ):
+            return False
+        feedback = getattr(self.summarizer, "feedback_homework", None)
+        if not callable(feedback):
+            return False
+        homework_text = _FEEDBACK_REQUEST.sub("", message.content).strip()
+        if len(homework_text) < 20:
+            reply = (
+                "已收到 #求反馈，但当前只有很少可读文字。"
+                "补充作业说明、收获或卡点后，我才能给具体反馈。"
+            )
+        else:
+            try:
+                reply = feedback(message.sender_name, homework_text)
+            except Exception:
+                logger.exception("MiniMax 作业反馈生成失败：%s", message.message_id)
+                reply = "这次反馈生成没有通过格式校验，作业打卡已正常记录。"
+        self.api.reply_post(
+            message.message_id,
+            reply,
+            f"homework-feedback-{message.message_id}",
+        )
+        return True
 
     def _answer_leader_attendance_override(
         self,
@@ -1845,6 +2090,8 @@ class GroupSummaryService:
         submitted_at = datetime.fromtimestamp(message.create_time_ms / 1000, tz=self.settings.tz)
 
         mentioned_query = self._mentioned_query(text)
+        if mentioned_query in _MENU_SHORTCUTS:
+            mentioned_query = _MENU_SHORTCUTS[mentioned_query]
         command_text = mentioned_query if mentioned_query is not None else text
         if self._is_summary_command(command_text) or (
             mentioned_query is not None and "日报" in mentioned_query
@@ -1876,8 +2123,11 @@ class GroupSummaryService:
         inserted = self.store.add_message(stored)
         if inserted:
             logger.info("已收集群消息：chat=%s message=%s", message.chat_id, message.message_id)
+        elif _FEEDBACK_REQUEST.search(text):
+            return False
         if self._record_iteration(text, stored):
             return True
+        report_dates: List[str] = []
         if inserted:
             report_dates = self._submission_report_dates(text, submitted_at.date())
             if not report_dates and (
@@ -1896,12 +2146,36 @@ class GroupSummaryService:
                         message.message_id,
                     )
             self._maybe_react_to_homework(stored, report_dates, submitted_at)
+            if _FEEDBACK_REQUEST.search(text):
+                if self._maybe_answer_feedback(stored, report_dates):
+                    return True
         if mentioned_query is not None and self.settings.send_enabled:
+            if _MENU_INTENT.search(mentioned_query):
+                self.api.reply_post(
+                    message.message_id,
+                    self._answer_menu(),
+                    f"menu-{message.message_id}",
+                )
+                return True
             if _TABLE_LINK_INTENT.search(mentioned_query):
                 self.api.reply_text(
                     message.message_id,
                     self._answer_table_link(),
                     f"table-link-{message.message_id}",
+                )
+                return True
+            if _MY_STATS_INTENT.search(mentioned_query):
+                self.api.reply_post(
+                    message.message_id,
+                    self._answer_my_stats(stored, submitted_at.date()),
+                    f"my-stats-{message.message_id}",
+                )
+                return True
+            if _WEEKLY_GROWTH_INTENT.search(mentioned_query):
+                self.api.reply_post(
+                    message.message_id,
+                    self._answer_weekly_growth(submitted_at.date(), message.chat_id),
+                    f"weekly-growth-{message.message_id}",
                 )
                 return True
             leader_override = self._leader_override_request(mentioned_query)
@@ -1944,9 +2218,18 @@ class GroupSummaryService:
             reply = self._answer_stats_question(
                 mentioned_query, submitted_at.date(), message.chat_id
             )
+            use_post = bool(_MEMBER_HISTORY_INTENT.search(mentioned_query))
+            if reply is None:
+                semantic_answer = self._semantic_query_answer(
+                    mentioned_query,
+                    submitted_at.date(),
+                    message.chat_id,
+                )
+                if semantic_answer is not None:
+                    reply, use_post = semantic_answer
             if reply is None:
                 reply = "我目前只支持查询作业、复盘、未交名单和日报。"
-            if _MEMBER_HISTORY_INTENT.search(mentioned_query):
+            if use_post:
                 self.api.reply_post(
                     message.message_id,
                     reply,

@@ -43,6 +43,27 @@ LEADER_COMMAND_PROMPT = """你是课程作业机器人的受限指令解析器�
 """
 
 
+QUERY_COMMAND_PROMPT = """你是课程作业机器人的受限查询解析器。
+你只能识别作业/复盘统计查询和某个成员的全部打卡记录查询，不回答问题本身。
+修改状态、闲聊、课程知识和目标不清晰的话，intent 必须为 unsupported。
+目标成员只能从系统名单原样选择；没提到成员时 target 为 null。
+“掉队、还差、没跟上、谁还没弄”都是 missing；“谁做了、谁完成了”是 completed；要整体分组或情况是 summary。
+作业序号没有明说时返回 null。
+只输出一个 JSON 对象，不要 Markdown、解释或其他文字：
+{"intent":"attendance_query|member_history|unsupported","topic":"homework|review|null","mode":"summary|missing|completed|null","assignment_number":1,"target":"成员名|null","confidence":0.0}
+"""
+
+
+HOMEWORK_FEEDBACK_PROMPT = """你是课程作业助教。只根据成员主动提供的作业文字、作业说明和复盘做简短反馈。
+不打分，不虚构作品画面、链接内容或成员没写的事实，不把通用鸡汤当反馈。
+如果文字里信息不足，就明确说明只能根据已提供文字判断。
+只输出下面三行，每行不超过80个中文字：
+亮点：……
+可继续打磨：……
+下一步：……
+"""
+
+
 _THINK_BLOCK = re.compile(r"<think\b[^>]*>.*?</think\s*>", re.IGNORECASE | re.DOTALL)
 _EXPECTED_REVIEWS = re.compile(r"^有效复盘名单JSON：(?P<value>.+)$", re.MULTILINE)
 _REQUIRED_SECTIONS = ("📝 每日复盘", "💬 群内反馈", "🔍 方法与待解决")
@@ -223,6 +244,83 @@ class Summarizer:
             "assignment_number": assignment_number,
             "confidence": float(confidence),
         }
+
+    def interpret_query(self, command: str, roster: Iterable[str]) -> Optional[dict]:
+        """把课程统计自然语言收敛成只读查询 JSON。"""
+        allowed_names = tuple(dict.fromkeys(str(name) for name in roster))
+        raw = self._complete(
+            "群成员名单JSON："
+            + json.dumps(allowed_names, ensure_ascii=False)
+            + "\n待解析问题："
+            + command,
+            system_prompt=QUERY_COMMAND_PROMPT,
+            max_output_tokens=500,
+            temperature=0.0,
+        )
+        candidate = raw.strip()
+        if candidate.startswith("```"):
+            candidate = re.sub(r"^```(?:json)?\s*|\s*```$", "", candidate, flags=re.I)
+        start = candidate.find("{")
+        end = candidate.rfind("}")
+        if start < 0 or end < start:
+            return None
+        try:
+            parsed = json.loads(candidate[start : end + 1])
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(parsed, dict):
+            return None
+        intent = parsed.get("intent")
+        if intent not in {"attendance_query", "member_history"}:
+            return None
+        confidence = parsed.get("confidence")
+        if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
+            return None
+        if float(confidence) < 0.9:
+            return None
+        assignment_number = parsed.get("assignment_number")
+        if assignment_number is not None and (
+            isinstance(assignment_number, bool)
+            or not isinstance(assignment_number, int)
+            or assignment_number < 1
+        ):
+            return None
+        target = parsed.get("target")
+        if target is not None and target not in allowed_names:
+            return None
+        if intent == "member_history" and target is None:
+            return None
+        topic = parsed.get("topic")
+        mode = parsed.get("mode")
+        if intent == "attendance_query":
+            if topic not in {"homework", "review"}:
+                return None
+            if mode not in {"summary", "missing", "completed"}:
+                return None
+        return {
+            "intent": intent,
+            "topic": topic,
+            "mode": mode,
+            "assignment_number": assignment_number,
+            "target": target,
+            "confidence": float(confidence),
+        }
+
+    def feedback_homework(self, member_name: str, homework_text: str) -> str:
+        """仅在成员显式 #求反馈 时生成三行受限点评。"""
+        result = self._complete(
+            f"成员：{member_name}\n作业文字：\n{homework_text}",
+            system_prompt=HOMEWORK_FEEDBACK_PROMPT,
+            max_output_tokens=800,
+            temperature=0.2,
+        )
+        lines = [line.strip() for line in result.splitlines() if line.strip()]
+        expected = ("亮点：", "可继续打磨：", "下一步：")
+        if len(lines) != 3 or any(
+            not line.startswith(prefix) for line, prefix in zip(lines, expected)
+        ):
+            raise RuntimeError("MiniMax 作业反馈格式校验失败")
+        return "\n".join(lines)
 
     def _chunks(self, lines: Iterable[str]) -> List[str]:
         chunks: List[str] = []
