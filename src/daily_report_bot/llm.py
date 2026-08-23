@@ -32,6 +32,17 @@ SYSTEM_PROMPT = """你是进阶营作业群日报整理员。只根据提供的�
 输出纯文本，不要使用 Markdown 的 # 标题、**加粗**、- 列表或代码标记。"""
 
 
+LEADER_COMMAND_PROMPT = """你是课程作业机器人的受限指令解析器。
+你只判断这句话是否明确要求把若干群成员的某次作业状态改为正常提交、补卡或未提交。
+不是这类代改指令，或目标人、状态不明确时，intent 必须为 unsupported。
+目标成员只能从系统给出的名单原样选择，不得创造、改写或猜测名字。
+“补了、补作业、补交、补提交、算补卡”的状态都是 late；“交了、完成了、算正常提交”是 completed；“没交、未完成”是 missing。
+作业序号没有明说时返回 null，不要自己猜第几次。
+只输出一个 JSON 对象，不要 Markdown、解释或其他文字：
+{"intent":"leader_override|unsupported","targets":["成员名"],"status":"completed|late|missing|null","assignment_number":1,"confidence":0.0}
+"""
+
+
 _THINK_BLOCK = re.compile(r"<think\b[^>]*>.*?</think\s*>", re.IGNORECASE | re.DOTALL)
 _EXPECTED_REVIEWS = re.compile(r"^有效复盘名单JSON：(?P<value>.+)$", re.MULTILINE)
 _REQUIRED_SECTIONS = ("📝 每日复盘", "💬 群内反馈", "🔍 方法与待解决")
@@ -106,11 +117,17 @@ class Summarizer:
     def close(self) -> None:
         self.client.close()
 
-    def _complete(self, prompt: str) -> str:
+    def _complete(
+        self,
+        prompt: str,
+        *,
+        system_prompt: str = SYSTEM_PROMPT,
+        max_output_tokens: int = 6000,
+    ) -> str:
         payload = {
             "model": self.model,
             "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt},
             ],
             "temperature": 0.2,
@@ -120,9 +137,9 @@ class Summarizer:
             # can be consumed entirely by <think>, leaving no report body.
             payload["thinking"] = {"type": "disabled"}
             payload["reasoning_split"] = True
-            payload["max_completion_tokens"] = 6000
+            payload["max_completion_tokens"] = max_output_tokens
         else:
-            payload["max_tokens"] = 2000
+            payload["max_tokens"] = min(max_output_tokens, 2000)
         # DeepSeek V4 默认开启思考模式。日报是结构化摘要，关闭它可减少延迟和费用。
         if self.model.startswith("deepseek-v4-"):
             payload["thinking"] = {"type": "disabled"}
@@ -144,6 +161,66 @@ class Summarizer:
         if not cleaned:
             raise RuntimeError("模型只返回了思考过程，没有可用总结")
         return cleaned
+
+    def interpret_leader_override(
+        self,
+        command: str,
+        roster: Iterable[str],
+    ) -> Optional[dict]:
+        """把自然语言组长代改指令收敛成可校验的小型 JSON。
+
+        模型只有解析权；目标名单、可用状态和置信度在这里再做一次
+        确定性校验，真正写表仍由 service 层完成。
+        """
+        allowed_names = tuple(dict.fromkeys(str(name) for name in roster))
+        raw = self._complete(
+            "群成员名单JSON："
+            + json.dumps(allowed_names, ensure_ascii=False)
+            + "\n待解析指令："
+            + command,
+            system_prompt=LEADER_COMMAND_PROMPT,
+            max_output_tokens=500,
+        )
+        candidate = raw.strip()
+        if candidate.startswith("```"):
+            candidate = re.sub(r"^```(?:json)?\s*|\s*```$", "", candidate, flags=re.I)
+        start = candidate.find("{")
+        end = candidate.rfind("}")
+        if start < 0 or end < start:
+            return None
+        try:
+            parsed = json.loads(candidate[start : end + 1])
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(parsed, dict) or parsed.get("intent") != "leader_override":
+            return None
+        confidence = parsed.get("confidence")
+        if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
+            return None
+        if float(confidence) < 0.9:
+            return None
+        status = parsed.get("status")
+        if status not in {"completed", "late", "missing"}:
+            return None
+        targets = parsed.get("targets")
+        if not isinstance(targets, list) or not targets:
+            return None
+        normalized_targets = tuple(dict.fromkeys(str(name) for name in targets))
+        if any(name not in allowed_names for name in normalized_targets):
+            return None
+        assignment_number = parsed.get("assignment_number")
+        if assignment_number is not None and (
+            isinstance(assignment_number, bool)
+            or not isinstance(assignment_number, int)
+            or assignment_number < 1
+        ):
+            return None
+        return {
+            "targets": normalized_targets,
+            "status": status,
+            "assignment_number": assignment_number,
+            "confidence": float(confidence),
+        }
 
     def _chunks(self, lines: Iterable[str]) -> List[str]:
         chunks: List[str] = []

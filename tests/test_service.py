@@ -94,6 +94,18 @@ class FakeSummarizer:
         )
 
 
+class FakeSemanticSummarizer(FakeSummarizer):
+    def interpret_leader_override(self, command, roster):
+        assert command == "第三次那份，卫安和米粒都算补了吧"
+        assert "卫安" in roster and "米粒" in roster
+        return {
+            "targets": ("卫安", "米粒"),
+            "status": "late",
+            "assignment_number": 3,
+            "confidence": 0.98,
+        }
+
+
 def test_transcript_normalizes_known_feishu_display_names():
     message = StoredMessage(
         message_id="om_alias",
@@ -460,6 +472,116 @@ def test_group_leader_can_mark_another_member_completed(tmp_path):
     ]
 
 
+def test_group_leader_can_mark_multiple_members_late_including_comma_name(tmp_path):
+    original = make_settings(tmp_path)
+    settings = replace(
+        original,
+        assignment_cycle_start_date="2026-08-17",
+        assignment_cycle_days=2,
+        assignment_publish_hour=10,
+        assignment_due_hour=20,
+        base_sync_enabled=True,
+        base_token="bas_test",
+        base_table_id="tbl_test",
+        report_members=("组长", "卫安", "米粒", "，"),
+        member_aliases={
+            "ou_leader": "组长",
+            "ou_weian": "卫安",
+            "ou_mili": "米粒",
+            "ou_comma": "，",
+        },
+        leader_member_ids=("ou_leader",),
+    )
+    api = FakeApi()
+    store = LocalStore(settings.db_path)
+    service = GroupSummaryService(settings, api, FakeSummarizer(), store)
+    service.handle_message(
+        incoming(
+            "om_third_cycle_seed",
+            "第3次作业发布",
+            sender_open_id="ou_leader",
+            created_at=datetime(2026, 8, 21, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+    )
+
+    service.handle_message(
+        incoming(
+            "om_multi_override",
+            "@知识库助手 卫安、米粒、，已补交",
+            sender_open_id="ou_leader",
+            created_at=datetime(2026, 8, 23, 20, 15, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+    )
+
+    attendance = {
+        record.sender_name: record for record in store.list_daily_attendance("2026-08-21")
+    }
+    assert attendance["卫安"].homework_status == "late"
+    assert attendance["米粒"].homework_status == "late"
+    assert attendance["，"].homework_status == "late"
+    assert service._leader_override_request("卫安、米粒、，已补交") == (
+        ("卫安", "米粒", "，"),
+        "late",
+    )
+    manual_updates = [fields for _, fields in api.base_updates if set(fields) == {"人工状态"}]
+    assert len(manual_updates) == 3
+    assert {fields["人工状态"] for fields in manual_updates} == {"补卡"}
+    assert "把卫安、米粒、，的第3次作业" in api.replies[-1][1]
+    assert store.list_homework_verifications("2026-08-21") == []
+    audit = store.list_attendance_overrides("2026-08-21")
+    assert len(audit) == 1
+    assert audit[0]["member_name"] == "卫安、米粒、，"
+    assert audit[0]["status"] == "late"
+
+
+def test_group_leader_natural_language_override_uses_constrained_minimax(tmp_path):
+    original = make_settings(tmp_path)
+    settings = replace(
+        original,
+        assignment_cycle_start_date="2026-08-17",
+        assignment_cycle_days=2,
+        assignment_publish_hour=10,
+        assignment_due_hour=20,
+        base_sync_enabled=True,
+        base_token="bas_test",
+        base_table_id="tbl_test",
+        report_members=("组长", "卫安", "米粒"),
+        member_aliases={
+            "ou_leader": "组长",
+            "ou_weian": "卫安",
+            "ou_mili": "米粒",
+        },
+        leader_member_ids=("ou_leader",),
+    )
+    api = FakeApi()
+    store = LocalStore(settings.db_path)
+    service = GroupSummaryService(settings, api, FakeSemanticSummarizer(), store)
+    service.handle_message(
+        incoming(
+            "om_semantic_cycle_seed",
+            "第3次作业发布",
+            sender_open_id="ou_leader",
+            created_at=datetime(2026, 8, 21, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+    )
+
+    service.handle_message(
+        incoming(
+            "om_semantic_override",
+            "@知识库助手 第三次那份，卫安和米粒都算补了吧",
+            sender_open_id="ou_leader",
+            created_at=datetime(2026, 8, 23, 20, 30, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+    )
+
+    attendance = {
+        record.sender_name: record for record in store.list_daily_attendance("2026-08-21")
+    }
+    assert attendance["卫安"].homework_status == "late"
+    assert attendance["米粒"].homework_status == "late"
+    assert "把卫安、米粒的第3次作业" in api.replies[-1][1]
+
+
 def test_group_leader_can_mark_historical_assignment_late(tmp_path):
     original = make_settings(tmp_path)
     settings = replace(
@@ -535,6 +657,37 @@ def test_status_question_is_not_parsed_as_leader_override(tmp_path):
     _, _, _, _, service = make_service(tmp_path)
 
     assert service._leader_override_request("Arina完成了吗？") is None
+
+
+def test_makeup_submission_spelling_is_recognized_as_late(tmp_path):
+    original = make_settings(tmp_path)
+    settings = replace(
+        original,
+        assignment_cycle_start_date="2026-08-17",
+        assignment_cycle_days=2,
+        assignment_publish_hour=10,
+        assignment_due_hour=20,
+        member_aliases={**original.member_aliases, "ou_2": "米粒"},
+        report_members=("小李", "米粒"),
+    )
+    api = FakeApi()
+    store = LocalStore(settings.db_path)
+    service = GroupSummaryService(settings, api, FakeSummarizer(), store)
+
+    service.handle_message(
+        incoming(
+            "om_makeup_submission_spelling",
+            "#0822 第3次作业补提交\n技术作业\n成果链接：https://example.com/work",
+            sender_open_id="ou_2",
+            created_at=datetime(2026, 8, 23, 19, 52, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+    )
+
+    attendance = {
+        record.sender_name: record for record in store.list_daily_attendance("2026-08-21")
+    }
+    assert attendance["米粒"].homework_status == "late"
+    assert attendance["米粒"].homework_message_ids == ("om_makeup_submission_spelling",)
 
 
 def test_bot_mention_resolves_chinese_assignment_number_instead_of_current_cycle(

@@ -112,6 +112,77 @@ def test_minimax_m3_disables_thinking_and_uses_current_token_parameter():
     assert "💬 群内反馈" in result
 
 
+def test_minimax_interprets_natural_leader_override_as_strict_json():
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        assert "受限指令解析器" in payload["messages"][0]["content"]
+        assert "卫安" in payload["messages"][1]["content"]
+        assert payload["max_completion_tokens"] == 500
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                "```json\n"
+                                '{"intent":"leader_override","targets":["卫安","米粒"],'
+                                '"status":"late","assignment_number":3,"confidence":0.98}'
+                                "\n```"
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+
+    summarizer = Summarizer(
+        "https://api.minimaxi.com/v1",
+        "secret",
+        "MiniMax-M3",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    assert summarizer.interpret_leader_override(
+        "第三次那份，卫安和米粒都算补了吧",
+        ("卫安", "米粒", "，"),
+    ) == {
+        "targets": ("卫安", "米粒"),
+        "status": "late",
+        "assignment_number": 3,
+        "confidence": 0.98,
+    }
+
+
+def test_minimax_rejects_unlisted_target_from_command_interpretation():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                '{"intent":"leader_override","targets":["不在群里的人"],'
+                                '"status":"completed","assignment_number":3,'
+                                '"confidence":0.99}'
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+
+    summarizer = Summarizer(
+        "https://api.minimaxi.com/v1",
+        "secret",
+        "MiniMax-M3",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    assert summarizer.interpret_leader_override("他已经交了", ("卫安", "米粒")) is None
+
+
 def test_minimax_m3_normalizes_review_count_placeholder_from_fixed_facts():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(

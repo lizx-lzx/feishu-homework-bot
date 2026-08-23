@@ -24,8 +24,8 @@ _EXPLICIT_REVIEW_DATE = re.compile(
 )
 _REVIEW_MARKER = re.compile(r"#\s*[^#\n]{0,24}?复盘(?:打卡|总结)?")
 _COMPLETION_STATUS = (
-    r"已完成补打卡|已完成补交|已完成补卡|补交打卡|"
-    r"已补打卡|补打卡|已补交|补交|已补卡|补卡|已完成|完成"
+    r"已完成补打卡|已完成补提交|已完成补交|已完成补卡|补交打卡|"
+    r"已补打卡|补打卡|已补提交|补提交|已补交|补交|已补卡|补卡|已完成|完成"
 )
 _DATED_COMPLETION_MARKER = re.compile(
     rf"#\s*(?P<mmdd>\d{{4}})\s*日?\s*(?P<label>[^#\n]{{0,30}}?)"
@@ -38,7 +38,7 @@ _NATURAL_DATED_COMPLETION_MARKER = re.compile(
     r"(?=$|[\s，。！!]|https?://)"
 )
 _DAY_HOMEWORK_MARKER = re.compile(r"#\s*作业\s+(?P<assignment>DAY\s*\d+)", re.IGNORECASE)
-_LATE_MARKER = re.compile(r"(?:#\s*)?补(?:交|卡|打卡)")
+_LATE_MARKER = re.compile(r"(?:#\s*)?补(?:提交|交|卡|打卡)")
 _MENTION_ONLY_PREFIX = re.compile(r"^(?:@[\w\u4e00-\u9fff.\-·]+ *){0,2}$")
 _NON_HOMEWORK_LABELS = ("复盘", "迭代", "补交", "补卡")
 _LATE_TAG_WINDOW_MS = 10 * 60 * 1000
@@ -66,12 +66,13 @@ _TABLE_LINK_INTENT = re.compile(
     r"|(?:打卡表|表格).{0,8}(?:链接|在哪|打开|查看)"
 )
 _LEADER_OVERRIDE_STATUS = re.compile(
-    r"(?P<status>未提交|没交|未完成|已完成补交|已完成补卡|已补交|补交|"
+    r"(?P<status>未提交|没交|未完成|已完成补提交|已完成补交|已完成补卡|"
+    r"已补提交|补提交|已补交|补交|"
     r"已补卡|补卡|正常提交|已提交|已完成|完成)\s*[。.!！]*$"
 )
 _MISSING_INTENT = re.compile(r"没交|未交|没完成|未完成|缺交|还差|还有谁")
 _COMPLETED_INTENT = re.compile(r"谁(?:已经|已)?(?:交了|完成)|已交(?:人员|名单)?|完成人员")
-_MAKEUP_DECLARATION = re.compile(r"补(?:打卡|交|卡)")
+_MAKEUP_DECLARATION = re.compile(r"补(?:打卡|提交|交|卡)")
 _MAKEUP_QUERY_INTENT = re.compile(
     r"谁|哪些|哪几|名单|人员|成员|情况|状态|统计|查询|查一下|"
     r"多少|几人|为什么|怎么|如何|是否|能否|吗|么|[？?]"
@@ -413,24 +414,28 @@ class GroupSummaryService:
             f"已迭代（{len(completed)}人）：{self._names(completed)}"
         )
 
-    def _leader_override_request(self, question: str) -> Optional[Tuple[str, str]]:
-        """解析“成员名已完成/已补交/未提交”这类组长代改命令。"""
+    def _leader_override_request(self, question: str) -> Optional[Tuple[Tuple[str, ...], str]]:
+        """解析“成员A、成员B已补交”这类组长代改命令。"""
         status_match = _LEADER_OVERRIDE_STATUS.search(question)
         if status_match is None:
             return None
         prefix = question[: status_match.start()].strip()
         if not prefix:
             return None
-        candidates: List[str] = []
+        candidates: List[Tuple[int, str]] = []
         for name in sorted(self.settings.report_members, key=len, reverse=True):
             if name == "，":
-                compact = prefix.lstrip("帮把将 ")
-                if compact.startswith("@，") or compact.startswith("，"):
-                    candidates.append(name)
-            elif name in prefix:
-                candidates.append(name)
-        if len(candidates) != 1:
+                continue
+            position = prefix.find(name)
+            if position >= 0:
+                candidates.append((position, name))
+        compact = prefix.lstrip("帮把将 ")
+        comma_target = re.search(r"(?:^|[、,])\s*@?(，)\s*$", compact)
+        if comma_target:
+            candidates.append((comma_target.start(1), "，"))
+        if not candidates:
             return None
+        target_names = tuple(name for _, name in sorted(candidates))
         raw_status = status_match.group("status")
         if raw_status in {"未提交", "没交", "未完成"}:
             status = "missing"
@@ -438,7 +443,47 @@ class GroupSummaryService:
             status = "late"
         else:
             status = "completed"
-        return candidates[0], status
+        return target_names, status
+
+    def _semantic_leader_override_request(
+        self,
+        question: str,
+        reference_day: date,
+    ) -> Optional[Tuple[Tuple[str, ...], str, str]]:
+        """用模型理解灵活说法，但只接受通过白名单校验的代改结果。"""
+        interpreter = getattr(self.summarizer, "interpret_leader_override", None)
+        if not callable(interpreter):
+            return None
+        try:
+            parsed = interpreter(question, self.settings.report_members)
+        except Exception:
+            logger.exception("MiniMax 组长指令语义解析失败")
+            return None
+        if not isinstance(parsed, dict):
+            return None
+        target_names = parsed.get("targets")
+        status = parsed.get("status")
+        assignment_number = parsed.get("assignment_number")
+        if (
+            not isinstance(target_names, tuple)
+            or not target_names
+            or status not in {"completed", "late", "missing"}
+        ):
+            return None
+        if any(name not in self.settings.report_members for name in target_names):
+            return None
+        normalized_question = question
+        if assignment_number is not None:
+            _, _, current_assignment = self.settings.assignment_cycle(reference_day)
+            if (
+                isinstance(assignment_number, bool)
+                or not isinstance(assignment_number, int)
+                or assignment_number < 1
+                or assignment_number > current_assignment
+            ):
+                return None
+            normalized_question = f"第{assignment_number}次作业 {question}"
+        return target_names, str(status), normalized_question
 
     def _answer_table_link(self) -> str:
         if not self.settings.report_link:
@@ -448,7 +493,7 @@ class GroupSummaryService:
     def _answer_leader_attendance_override(
         self,
         *,
-        target_name: str,
+        target_names: Sequence[str],
         status: str,
         question: str,
         reference_day: date,
@@ -461,24 +506,42 @@ class GroupSummaryService:
 
         requested_day = self._query_report_date(question, reference_day)
         report_date = self.settings.assignment_report_date(requested_day)
+        has_explicit_period = bool(
+            _ASSIGNMENT_NUMBER.search(question)
+            or _QUERY_FULL_DATE.search(question)
+            or _QUERY_MONTH_DAY.search(question)
+            or _QUERY_MMDD.search(question)
+            or "昨天" in question
+            or "前天" in question
+        )
+        if status == "late" and not has_explicit_period:
+            submitted_at = datetime.fromtimestamp(
+                message.create_time_ms / 1000,
+                tz=self.settings.tz,
+            )
+            current_report_date = self.settings.assignment_report_date(reference_day)
+            if submitted_at < self.settings.assignment_deadline(current_report_date):
+                current_cycle_start, _, _ = self.settings.assignment_cycle(current_report_date)
+                report_date = (
+                    current_cycle_start - timedelta(days=self.settings.assignment_cycle_days)
+                ).isoformat()
         self.sync_attendance_date(report_date, message.chat_id)
         records = self.api.list_base_records(
             self.settings.base_token,
             self.settings.base_table_id,
         )
         key_prefix = f"{report_date}|"
-        record = next(
-            (
-                item
-                for item in records
-                if str((item.get("fields") or {}).get("记录键") or "").startswith(key_prefix)
-                and self._base_cell_text((item.get("fields") or {}).get("组员姓名")) == target_name
-            ),
-            None,
-        )
-        if record is None or not record.get("record_id"):
+        records_by_name = {
+            self._base_cell_text((item.get("fields") or {}).get("组员姓名")): item
+            for item in records
+            if str((item.get("fields") or {}).get("记录键") or "").startswith(key_prefix)
+            and item.get("record_id")
+        }
+        missing_names = [name for name in target_names if name not in records_by_name]
+        if missing_names:
             return (
-                f"没有找到{target_name}在{self._assignment_period_label(report_date)}的表格记录。"
+                f"没有找到{self._names(missing_names)}在"
+                f"{self._assignment_period_label(report_date)}的表格记录。"
             )
 
         manual_values = {
@@ -487,25 +550,20 @@ class GroupSummaryService:
             "missing": "未提交",
         }
         manual_value = manual_values[status]
-        self.api.update_base_record(
-            self.settings.base_token,
-            self.settings.base_table_id,
-            str(record["record_id"]),
-            {"人工状态": manual_value},
-        )
-        member_key = next(
-            (
-                open_id
-                for open_id, name in self.settings.member_aliases.items()
-                if name == target_name
-            ),
-            f"name:{target_name}",
-        )
+        for target_name in target_names:
+            self.api.update_base_record(
+                self.settings.base_token,
+                self.settings.base_table_id,
+                str(records_by_name[target_name]["record_id"]),
+                {"人工状态": manual_value},
+            )
+        open_id_by_name = {name: open_id for open_id, name in self.settings.member_aliases.items()}
+        member_keys = [open_id_by_name.get(name, f"name:{name}") for name in target_names]
         self.store.add_attendance_override(
             message_id=message.message_id,
             report_date=report_date,
-            member_key=member_key,
-            member_name=target_name,
+            member_key="、".join(member_keys),
+            member_name="、".join(target_names),
             status=status,
             actor_open_id=message.sender_open_id,
             actor_name=message.sender_name,
@@ -513,7 +571,7 @@ class GroupSummaryService:
         )
         self.sync_attendance_date(report_date, message.chat_id)
         return (
-            f"已由组长{message.sender_name}把{target_name}的"
+            f"已由组长{message.sender_name}把{self._names(target_names)}的"
             f"{self._assignment_period_label(report_date)}标记为{manual_value}。\n"
             "数据库和多维表格已同步。"
         )
@@ -1847,12 +1905,21 @@ class GroupSummaryService:
                 )
                 return True
             leader_override = self._leader_override_request(mentioned_query)
+            override_question = mentioned_query
+            if leader_override is None and stored.sender_open_id in self.settings.leader_member_ids:
+                semantic_override = self._semantic_leader_override_request(
+                    mentioned_query,
+                    submitted_at.date(),
+                )
+                if semantic_override is not None:
+                    target_names, status, override_question = semantic_override
+                    leader_override = target_names, status
             if leader_override is not None:
-                target_name, status = leader_override
+                target_names, status = leader_override
                 reply = self._answer_leader_attendance_override(
-                    target_name=target_name,
+                    target_names=target_names,
                     status=status,
-                    question=mentioned_query,
+                    question=override_question,
                     reference_day=submitted_at.date(),
                     message=stored,
                 )
