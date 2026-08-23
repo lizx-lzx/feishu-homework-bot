@@ -299,6 +299,87 @@ def test_minimax_homework_feedback_requires_three_fixed_lines():
     assert "\n下一步：" in result
 
 
+def test_minimax_decides_constrained_social_reply_with_context():
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        assert "有分寸的 AI 助教" in payload["messages"][0]["content"]
+        assert "是否直接 @ 助教：yes" in payload["messages"][1]["content"]
+        assert "页面部署后别人打不开" in payload["messages"][1]["content"]
+        assert "群友甲：我也遇到过" in payload["messages"][1]["content"]
+        assert payload["temperature"] == 0.35
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                "```json\n"
+                                '{"action":"reply","reply":"先确认发出去的是公网链接。",'
+                                '"emoji":null,"confidence":0.97}'
+                                "\n```"
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+
+    summarizer = Summarizer(
+        "https://api.minimaxi.com/v1",
+        "secret",
+        "MiniMax-M3",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    assert summarizer.decide_social_response(
+        "小李",
+        "页面部署后别人打不开，怎么办？",
+        ("群友甲：我也遇到过",),
+        direct=True,
+    ) == {
+        "action": "reply",
+        "reply": "先确认发出去的是公网链接。",
+        "emoji": None,
+        "confidence": 0.97,
+    }
+
+
+def test_minimax_rejects_unapproved_social_reaction():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                '{"action":"react","reply":"","emoji":"UNKNOWN","confidence":0.99}'
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+
+    summarizer = Summarizer(
+        "https://api.minimaxi.com/v1",
+        "secret",
+        "MiniMax-M3",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    assert (
+        summarizer.decide_social_response(
+            "小李",
+            "终于跑通了",
+            (),
+            direct=False,
+        )
+        is None
+    )
+
+
 def test_minimax_m3_normalizes_review_count_placeholder_from_fixed_facts():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(

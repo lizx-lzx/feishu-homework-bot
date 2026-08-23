@@ -134,6 +134,24 @@ class FakeFeedbackSummarizer(FakeSummarizer):
         )
 
 
+class FakeSocialSummarizer(FakeSummarizer):
+    def __init__(self, *decisions):
+        super().__init__()
+        self.decisions = list(decisions)
+        self.social_calls = []
+
+    def decide_social_response(
+        self,
+        member_name,
+        message_text,
+        context_lines,
+        *,
+        direct,
+    ):
+        self.social_calls.append((member_name, message_text, list(context_lines), direct))
+        return self.decisions.pop(0)
+
+
 def test_transcript_normalizes_known_feishu_display_names():
     message = StoredMessage(
         message_id="om_alias",
@@ -554,6 +572,216 @@ def test_weekly_growth_card_is_generated_only_on_demand(tmp_path):
     assert reply.startswith("🌟 本周成长卡")
     assert "作业完成：1/2" in reply
     assert "🎯 全部准时：小李" in reply
+
+
+def test_direct_mention_can_start_natural_course_chat(tmp_path):
+    original = make_settings(tmp_path)
+    settings = replace(original, social_chat_enabled=True)
+    api = FakeApi()
+    summarizer = FakeSocialSummarizer(
+        {
+            "action": "reply",
+            "reply": "先确认你发的是部署后的公网链接，不是本地预览地址。",
+            "emoji": None,
+            "confidence": 0.97,
+        }
+    )
+    store = LocalStore(settings.db_path)
+    service = GroupSummaryService(settings, api, summarizer, store)
+
+    assert (
+        service.handle_message(
+            incoming(
+                "om_social_direct",
+                "@知识库助手 我这个 Cloudflare 页面部署后别人打不开，怎么排查？",
+            )
+        )
+        is True
+    )
+
+    assert summarizer.social_calls[0][3] is True
+    assert api.replies[-1][1].startswith("先确认你发的是部署后")
+    assert api.replies[-1][2] == "social-chat-om_social_direct"
+    assert store.social_chat_action_sent("om_social_direct") is True
+
+
+def test_proactive_social_chat_only_considers_useful_signals(tmp_path):
+    original = make_settings(tmp_path)
+    settings = replace(
+        original,
+        social_chat_enabled=True,
+        social_chat_proactive_enabled=True,
+    )
+    api = FakeApi()
+    summarizer = FakeSocialSummarizer(
+        {
+            "action": "reply",
+            "reply": "可以先用手机流量打开公网链接，把本地缓存和内网环境排除掉。",
+            "emoji": None,
+            "confidence": 0.80,
+        }
+    )
+    store = LocalStore(settings.db_path)
+    service = GroupSummaryService(settings, api, summarizer, store)
+    daytime = datetime(2026, 8, 11, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    service.handle_message(incoming("om_social_plain", "今天课程很有意思", created_at=daytime))
+    assert summarizer.social_calls == []
+
+    service.handle_message(
+        incoming(
+            "om_social_help",
+            "我的页面自己能打开，别人打不开，有没有办法排查？",
+            created_at=daytime,
+        )
+    )
+
+    assert len(summarizer.social_calls) == 1
+    assert summarizer.social_calls[0][3] is False
+    assert api.replies[-1][2] == "social-chat-om_social_help"
+
+
+def test_proactive_social_chat_uses_reaction_for_small_win(tmp_path):
+    original = make_settings(tmp_path)
+    settings = replace(
+        original,
+        social_chat_enabled=True,
+        social_chat_proactive_enabled=True,
+    )
+    api = FakeApi()
+    summarizer = FakeSocialSummarizer(
+        {
+            "action": "react",
+            "reply": "",
+            "emoji": "PARTY",
+            "confidence": 0.94,
+        }
+    )
+    store = LocalStore(settings.db_path)
+    service = GroupSummaryService(settings, api, summarizer, store)
+
+    service.handle_message(
+        incoming(
+            "om_social_win",
+            "终于把这个页面跑通了！",
+            created_at=datetime(2026, 8, 11, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+    )
+
+    assert api.reactions == [("om_social_win", "PARTY")]
+    assert api.replies == []
+    assert store.social_chat_action_sent("om_social_win") is True
+
+
+def test_proactive_social_chat_respects_cooldown_and_skips_homework(tmp_path):
+    original = make_settings(tmp_path)
+    settings = replace(
+        original,
+        social_chat_enabled=True,
+        social_chat_proactive_enabled=True,
+        social_chat_cooldown_minutes=10,
+    )
+    api = FakeApi()
+    summarizer = FakeSocialSummarizer(
+        {
+            "action": "reply",
+            "reply": "先看第一个报错行，把它前后两行一起发出来。",
+            "emoji": None,
+            "confidence": 0.96,
+        }
+    )
+    store = LocalStore(settings.db_path)
+    service = GroupSummaryService(settings, api, summarizer, store)
+    first_at = datetime(2026, 8, 11, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    service.handle_message(
+        incoming("om_social_first", "这里一直报错，怎么办？", created_at=first_at)
+    )
+    service.handle_message(
+        incoming(
+            "om_social_cooldown",
+            "另一个页面也卡住了，怎么办？",
+            sender_open_id="ou_2",
+            created_at=datetime(2026, 8, 11, 10, 5, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+    )
+    service.handle_message(
+        incoming(
+            "om_social_homework",
+            "#0811作业已完成 终于搞定了",
+            created_at=datetime(2026, 8, 11, 10, 20, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+    )
+
+    assert len(summarizer.social_calls) == 1
+    assert len(api.replies) == 1
+
+
+def test_proactive_social_chat_stays_quiet_at_night(tmp_path):
+    original = make_settings(tmp_path)
+    settings = replace(
+        original,
+        social_chat_enabled=True,
+        social_chat_proactive_enabled=True,
+    )
+    api = FakeApi()
+    summarizer = FakeSocialSummarizer(
+        {
+            "action": "reply",
+            "reply": "这条不应在静默时段发出。",
+            "emoji": None,
+            "confidence": 0.99,
+        }
+    )
+    store = LocalStore(settings.db_path)
+    service = GroupSummaryService(settings, api, summarizer, store)
+
+    service.handle_message(
+        incoming(
+            "om_social_night",
+            "我这里一直报错，怎么办？",
+            created_at=datetime(2026, 8, 11, 23, 30, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+    )
+
+    assert summarizer.social_calls == []
+    assert api.replies == []
+
+
+def test_replying_to_bot_continues_conversation_with_previous_reply_context(tmp_path):
+    original = make_settings(tmp_path)
+    settings = replace(original, social_chat_enabled=True)
+    api = FakeApi()
+    summarizer = FakeSocialSummarizer(
+        {
+            "action": "reply",
+            "reply": "先确认部署链接和本地预览链接不是同一个。",
+            "emoji": None,
+            "confidence": 0.97,
+        },
+        {
+            "action": "reply",
+            "reply": "然后用手机流量访问一次，这能快速排除局域网和缓存影响。",
+            "emoji": None,
+            "confidence": 0.96,
+        },
+    )
+    store = LocalStore(settings.db_path)
+    service = GroupSummaryService(settings, api, summarizer, store)
+
+    service.handle_message(incoming("om_social_turn_one", "@知识库助手 部署后别人打不开，怎么办？"))
+    service.handle_message(
+        incoming(
+            "om_social_turn_two",
+            "那下一步我先查什么？",
+            parent_id="om_reply",
+            created_at=datetime(2026, 8, 11, 18, 31, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+    )
+
+    assert len(api.replies) == 2
+    assert summarizer.social_calls[1][3] is True
+    assert any("助教：先确认部署链接" in line for line in summarizer.social_calls[1][2])
 
 
 def test_group_leader_can_mark_another_member_completed(tmp_path):

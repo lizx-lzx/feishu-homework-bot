@@ -160,6 +160,17 @@ class LocalStore:
                     reaction_id TEXT NOT NULL DEFAULT '',
                     reacted_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
+                CREATE TABLE IF NOT EXISTS social_chat_actions (
+                    message_id TEXT PRIMARY KEY,
+                    chat_id TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    response TEXT NOT NULL DEFAULT '',
+                    outbound_message_id TEXT NOT NULL DEFAULT '',
+                    event_time_ms INTEGER NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS idx_social_chat_actions_chat_time
+                    ON social_chat_actions(chat_id, event_time_ms);
                 """
             )
             existing_columns = {
@@ -223,6 +234,27 @@ class LocalStore:
                 (chat_id, start_ms, end_ms, limit),
             ).fetchall()
         return [StoredMessage(**dict(row)) for row in rows]
+
+    def list_recent_messages(
+        self,
+        chat_id: str,
+        through_ms: int,
+        limit: int = 12,
+    ) -> List[StoredMessage]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT message_id, chat_id, sender_open_id, sender_name,
+                       message_type, content, create_time_ms,
+                       parent_id, root_id, thread_id
+                FROM group_messages
+                WHERE chat_id = ? AND create_time_ms <= ?
+                ORDER BY create_time_ms DESC
+                LIMIT ?
+                """,
+                (chat_id, through_ms, limit),
+            ).fetchall()
+        return [StoredMessage(**dict(row)) for row in reversed(rows)]
 
     def thread_roots(self, chat_id: str, thread_ids: Sequence[str]) -> Dict[str, StoredMessage]:
         """返回话题的根消息，用于把跨日回复归到话题发布的那次作业。"""
@@ -648,6 +680,95 @@ class LocalStore:
                 ) VALUES (?, ?, ?, ?, ?)
                 """,
                 (message_id, report_date, chat_id, emoji_type, reaction_id),
+            )
+
+    def social_chat_action_sent(self, message_id: str) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM social_chat_actions WHERE message_id = ?",
+                (message_id,),
+            ).fetchone()
+        return row is not None
+
+    def social_chat_action_count(self, chat_id: str, since_ms: int) -> int:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS total
+                FROM social_chat_actions
+                WHERE chat_id = ? AND event_time_ms >= ?
+                """,
+                (chat_id, since_ms),
+            ).fetchone()
+        return int(row["total"] or 0)
+
+    def social_chat_parent_known(self, message_id: str) -> bool:
+        if not message_id:
+            return False
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM social_chat_actions WHERE outbound_message_id = ?",
+                (message_id,),
+            ).fetchone()
+        return row is not None
+
+    def last_social_chat_action_ms(self, chat_id: str) -> int:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT MAX(event_time_ms) AS latest
+                FROM social_chat_actions
+                WHERE chat_id = ?
+                """,
+                (chat_id,),
+            ).fetchone()
+        return int(row["latest"] or 0)
+
+    def list_recent_social_chat_actions(
+        self,
+        chat_id: str,
+        through_ms: int,
+        limit: int = 3,
+    ) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT action, response, event_time_ms
+                FROM social_chat_actions
+                WHERE chat_id = ? AND event_time_ms <= ?
+                ORDER BY event_time_ms DESC
+                LIMIT ?
+                """,
+                (chat_id, through_ms, limit),
+            ).fetchall()
+        return [dict(row) for row in reversed(rows)]
+
+    def mark_social_chat_action(
+        self,
+        *,
+        message_id: str,
+        chat_id: str,
+        action: str,
+        response: str,
+        outbound_message_id: str,
+        event_time_ms: int,
+    ) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO social_chat_actions(
+                    message_id, chat_id, action, response,
+                    outbound_message_id, event_time_ms
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    message_id,
+                    chat_id,
+                    action,
+                    response,
+                    outbound_message_id,
+                    event_time_ms,
+                ),
             )
 
     def base_sync_state(self, record_key: str) -> Optional[Tuple[str, str]]:

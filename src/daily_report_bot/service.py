@@ -77,6 +77,27 @@ _MENU_SHORTCUTS = {
     "5": "本周成长卡",
     "6": "打开打卡表",
 }
+_SEMANTIC_STATS_SIGNAL = re.compile(
+    r"掉队|没跟上|还差|进度|战绩|第\s*[0-9一二三四五六七八九十]+\s*次"
+    r"|谁.{0,8}(?:做|交|完成|复盘)|(?:全部|历史).{0,8}(?:记录|打卡|作业)"
+)
+_SOCIAL_PROACTIVE_SIGNAL = re.compile(
+    r"怎么办|怎么弄|怎么做|怎么解决|为什么|为啥|不会|不懂|卡住|卡在|报错"
+    r"|打不开|求助|帮我|有人知道|有没有办法|能不能|如何|哪位知道|终于|跑通了|搞定了"
+    r"|部署好了|解决了|成功了"
+)
+_SOCIAL_SKIP_SIGNAL = re.compile(
+    r"#\s*(?:\d{4}|复盘|迭代|求反馈)|打开日报|已完成|已提交|补卡|补交|补提交"
+)
+_CONVERSATIONAL_HELP_INTENT = re.compile(
+    r"怎么做|怎么弄|怎么解决|帮我看|帮我想|给我个思路|卡住|卡在|报错|打不开"
+    r"|部署|代码|页面|文案|排版|参考图|提示词"
+)
+_EXPLICIT_STATS_QUERY_SIGNAL = re.compile(
+    r"谁|名单|多少|几人|没交|未交|补卡|状态|进度|打卡|复盘"
+    r"|完成了吗|交了吗|第\s*[0-9一二三四五六七八九十]+\s*次"
+)
+_SOCIAL_FORBIDDEN_REPLY = re.compile(r"已帮你|已标记|已修改|已更新打卡|数据库已|多维表格已同步")
 _LEADER_OVERRIDE_STATUS = re.compile(
     r"(?P<status>未提交|没交|未完成|已完成补提交|已完成补交|已完成补卡|"
     r"已补提交|补提交|已补交|补交|"
@@ -732,6 +753,129 @@ class GroupSummaryService:
             message.message_id,
             reply,
             f"homework-feedback-{message.message_id}",
+        )
+        return True
+
+    def _social_chat_context(self, message: StoredMessage) -> List[str]:
+        timeline: List[Tuple[int, str]] = []
+        for recent in self.store.list_recent_messages(
+            message.chat_id,
+            message.create_time_ms,
+            limit=12,
+        ):
+            content = " ".join(recent.content.split())[:300]
+            if content:
+                timeline.append((recent.create_time_ms, f"{recent.sender_name}：{content}"))
+        for action in self.store.list_recent_social_chat_actions(
+            message.chat_id,
+            message.create_time_ms,
+            limit=3,
+        ):
+            if action.get("action") == "reply" and action.get("response"):
+                timeline.append((int(action["event_time_ms"]) + 1, f"助教：{action['response']}"))
+        return [line for _, line in sorted(timeline)[-12:]]
+
+    def _maybe_social_chat(
+        self,
+        message: StoredMessage,
+        *,
+        prompt_text: str,
+        direct: bool,
+    ) -> bool:
+        if not self.settings.send_enabled or not self.settings.social_chat_enabled:
+            return False
+        if message.message_type not in {"text", "post"}:
+            return False
+        if self.store.social_chat_action_sent(message.message_id):
+            return False
+        if not direct:
+            if not self.settings.social_chat_proactive_enabled:
+                return False
+            sent_at = datetime.fromtimestamp(message.create_time_ms / 1000, tz=self.settings.tz)
+            if sent_at.hour >= 23 or sent_at.hour < 8:
+                return False
+            if _SOCIAL_SKIP_SIGNAL.search(prompt_text):
+                return False
+            if _STATS_TOPIC.search(prompt_text) and _EXPLICIT_STATS_QUERY_SIGNAL.search(
+                prompt_text
+            ):
+                return False
+            if not _SOCIAL_PROACTIVE_SIGNAL.search(prompt_text):
+                return False
+            cooldown_ms = self.settings.social_chat_cooldown_minutes * 60 * 1000
+            last_action_ms = self.store.last_social_chat_action_ms(message.chat_id)
+            if last_action_ms and message.create_time_ms - last_action_ms < cooldown_ms:
+                return False
+            if (
+                self.store.social_chat_action_count(
+                    message.chat_id,
+                    message.create_time_ms - 60 * 60 * 1000,
+                )
+                >= self.settings.social_chat_hourly_limit
+            ):
+                return False
+
+        decider = getattr(self.summarizer, "decide_social_response", None)
+        if not callable(decider):
+            return False
+        try:
+            decision = decider(
+                message.sender_name,
+                prompt_text,
+                self._social_chat_context(message),
+                direct=direct,
+            )
+        except Exception:
+            logger.exception("MiniMax 群聊参与决策失败：%s", message.message_id)
+            return False
+        if not isinstance(decision, dict):
+            return False
+        action = decision.get("action")
+        confidence = decision.get("confidence")
+        if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
+            return False
+        threshold = 0.72 if direct else 0.85 if action == "react" else 0.78
+        if float(confidence) < threshold or action == "silent":
+            return False
+
+        response = ""
+        outbound_message_id = ""
+        try:
+            if action == "reply":
+                response = str(decision.get("reply") or "").strip()
+                if not response or _SOCIAL_FORBIDDEN_REPLY.search(response):
+                    return False
+                outbound_message_id = (
+                    self.api.reply_text(
+                        message.message_id,
+                        response,
+                        f"social-chat-{message.message_id}",
+                    )
+                    or ""
+                )
+            elif action == "react":
+                response = str(decision.get("emoji") or "")
+                if not response:
+                    return False
+                self.api.add_reaction(message.message_id, response)
+            else:
+                return False
+        except Exception:
+            logger.exception("MiniMax 群聊回应发送失败：%s", message.message_id)
+            return False
+        self.store.mark_social_chat_action(
+            message_id=message.message_id,
+            chat_id=message.chat_id,
+            action=str(action),
+            response=response,
+            outbound_message_id=outbound_message_id,
+            event_time_ms=message.create_time_ms,
+        )
+        logger.info(
+            "群助教已克制参与：chat=%s message=%s action=%s",
+            message.chat_id,
+            message.message_id,
+            action,
         )
         return True
 
@@ -2215,11 +2359,20 @@ class GroupSummaryService:
                     f"self-makeup-{message.message_id}",
                 )
                 return True
+            if _CONVERSATIONAL_HELP_INTENT.search(
+                mentioned_query
+            ) and not _EXPLICIT_STATS_QUERY_SIGNAL.search(mentioned_query):
+                if self._maybe_social_chat(
+                    stored,
+                    prompt_text=mentioned_query,
+                    direct=True,
+                ):
+                    return True
             reply = self._answer_stats_question(
                 mentioned_query, submitted_at.date(), message.chat_id
             )
             use_post = bool(_MEMBER_HISTORY_INTENT.search(mentioned_query))
-            if reply is None:
+            if reply is None and _SEMANTIC_STATS_SIGNAL.search(mentioned_query):
                 semantic_answer = self._semantic_query_answer(
                     mentioned_query,
                     submitted_at.date(),
@@ -2228,6 +2381,12 @@ class GroupSummaryService:
                 if semantic_answer is not None:
                     reply, use_post = semantic_answer
             if reply is None:
+                if self._maybe_social_chat(
+                    stored,
+                    prompt_text=mentioned_query,
+                    direct=True,
+                ):
+                    return True
                 reply = "我目前只支持查询作业、复盘、未交名单和日报。"
             if use_post:
                 self.api.reply_post(
@@ -2242,6 +2401,16 @@ class GroupSummaryService:
                     f"stats-question-{message.message_id}",
                 )
             return True
+        if inserted:
+            replying_to_bot = self.store.social_chat_parent_known(
+                stored.parent_id
+            ) or self.store.social_chat_parent_known(stored.root_id)
+            if self._maybe_social_chat(
+                stored,
+                prompt_text=text,
+                direct=replying_to_bot,
+            ):
+                return True
         return inserted
 
     def _load_messages(self, report_date: str, chat_id: str) -> List[StoredMessage]:

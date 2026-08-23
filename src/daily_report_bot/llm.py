@@ -64,12 +64,40 @@ HOMEWORK_FEEDBACK_PROMPT = """你是课程作业助教。只根据成员主动�
 """
 
 
+SOCIAL_CHAT_PROMPT = """你是课程群里一个有分寸的 AI 助教。你可以自然参与作业、AI 工具、项目实操和学习方法的讨论，但不要为了存在感硬插话。
+
+你只做决策，不执行统计、补卡、改表或群管理。必须遵守：
+1. 有人明确 @ 你时，作业/项目/学习范围内的正常问题可以 reply；范围外闲聊、敏感隐私、医疗法律金融等高风险内容选 silent。
+2. 没有 @ 你时，成员明确说“怎么办/怎么做/卡住/报错/打不开/有没有办法”等求助信号，且内容属于课程、AI 工具或项目实操时，原则上选 reply。信息不足时可以只问一个最关键的追问；明显在问其他人时才 silent。
+3. 纯打卡、纯复盘、催交、人员状态、“好的/收到/哈哈”、别人之间的对话优先 silent。
+4. 出现“终于跑通/搞定/解决/成功了”这类小进展，且不是带作业标签的例行打卡时，优先选 react，不要完全沉默。
+5. 不假装是真人，不编造亲身经历；不声称看过未提供内容的图片、网页或文件。
+6. reply 只写 1—3 句自然中文，最多 160 字，不用 Markdown 标题，不教训人，不重复群友刚说的话。
+7. 消息明确在 @ 其他人、并不是向你求助时，选 silent。
+
+只输出一个 JSON 对象，不要 Markdown 或解释：
+{"action":"silent|react|reply","reply":"","emoji":"LOVE|FISTBUMP|LAUGH|FINGERHEART|THINKING|OnIt|WOW|Get|HIGHFIVE|PARTY|null","confidence":0.0}
+"""
+
+
 _THINK_BLOCK = re.compile(r"<think\b[^>]*>.*?</think\s*>", re.IGNORECASE | re.DOTALL)
 _EXPECTED_REVIEWS = re.compile(r"^有效复盘名单JSON：(?P<value>.+)$", re.MULTILINE)
 _REQUIRED_SECTIONS = ("📝 每日复盘", "💬 群内反馈", "🔍 方法与待解决")
 _REVIEW_HEADING = re.compile(r"📝\s*每日复盘（[^\n）]*人）")
 _RAW_FEISHU_NAME = re.compile(r"(?:飞书用户|用户)[A-Za-z0-9]+")
 _REPORT_TAG = re.compile(r"#\s*(?:\d{4}|\d{1,2}月\d{1,2}日|复盘)")
+_SOCIAL_REACTIONS = {
+    "LOVE",
+    "FISTBUMP",
+    "LAUGH",
+    "FINGERHEART",
+    "THINKING",
+    "OnIt",
+    "WOW",
+    "Get",
+    "HIGHFIVE",
+    "PARTY",
+}
 
 
 def _clean_model_output(content: str) -> str:
@@ -321,6 +349,67 @@ class Summarizer:
         ):
             raise RuntimeError("MiniMax 作业反馈格式校验失败")
         return "\n".join(lines)
+
+    def decide_social_response(
+        self,
+        member_name: str,
+        message_text: str,
+        context_lines: Iterable[str],
+        *,
+        direct: bool,
+    ) -> Optional[dict]:
+        """决定群助教应当沉默、表情回应还是简短接话。"""
+        context = "\n".join(list(context_lines)[-12:])
+        raw = self._complete(
+            f"是否直接 @ 助教：{'yes' if direct else 'no'}\n"
+            f"当前发言人：{member_name}\n"
+            f"当前消息：{message_text}\n"
+            f"最近群聊（只作上下文）：\n{context}",
+            system_prompt=SOCIAL_CHAT_PROMPT,
+            max_output_tokens=600,
+            temperature=0.35,
+        )
+        candidate = raw.strip()
+        if candidate.startswith("```"):
+            candidate = re.sub(r"^```(?:json)?\s*|\s*```$", "", candidate, flags=re.I)
+        start = candidate.find("{")
+        end = candidate.rfind("}")
+        if start < 0 or end < start:
+            return None
+        try:
+            parsed = json.loads(candidate[start : end + 1])
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(parsed, dict):
+            return None
+        action = parsed.get("action")
+        if action not in {"silent", "react", "reply"}:
+            return None
+        confidence = parsed.get("confidence")
+        if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
+            return None
+        confidence = float(confidence)
+        if not 0.0 <= confidence <= 1.0:
+            return None
+        reply = str(parsed.get("reply") or "").strip()
+        emoji = parsed.get("emoji")
+        if action == "reply":
+            if not reply or len(reply) > 200:
+                return None
+            emoji = None
+        elif action == "react":
+            if emoji not in _SOCIAL_REACTIONS:
+                return None
+            reply = ""
+        else:
+            reply = ""
+            emoji = None
+        return {
+            "action": action,
+            "reply": reply,
+            "emoji": emoji,
+            "confidence": confidence,
+        }
 
     def _chunks(self, lines: Iterable[str]) -> List[str]:
         chunks: List[str] = []

@@ -121,6 +121,10 @@ class Settings:
     log_level: str
     summary_schedule_enabled: bool = True
     homework_reaction_enabled: bool = False
+    social_chat_enabled: bool = False
+    social_chat_proactive_enabled: bool = False
+    social_chat_cooldown_minutes: int = 10
+    social_chat_hourly_limit: int = 3
     member_aliases: Dict[str, str] = field(default_factory=lambda: dict(DEFAULT_MEMBER_ALIASES))
     visible_name_aliases: Dict[str, str] = field(default_factory=dict)
     excluded_member_ids: Tuple[str, ...] = field(
@@ -246,6 +250,10 @@ class Settings:
                 raise ConfigurationError(f"{label}时间不合法")
         if self.assignment_cycle_days < 1:
             raise ConfigurationError("ASSIGNMENT_CYCLE_DAYS 必须大于等于 1")
+        if self.social_chat_cooldown_minutes < 1:
+            raise ConfigurationError("SOCIAL_CHAT_COOLDOWN_MINUTES 必须大于等于 1")
+        if self.social_chat_hourly_limit < 1:
+            raise ConfigurationError("SOCIAL_CHAT_HOURLY_LIMIT 必须大于等于 1")
         if self.assignment_cycle_start_date:
             try:
                 datetime.strptime(self.assignment_cycle_start_date, "%Y-%m-%d")
@@ -299,6 +307,10 @@ def load_settings(env_file: str = ".env") -> Settings:
         send_enabled=_bool("SUMMARY_SEND_ENABLED", True),
         summary_schedule_enabled=_bool("SUMMARY_SCHEDULE_ENABLED", True),
         homework_reaction_enabled=_bool("HOMEWORK_REACTION_ENABLED", False),
+        social_chat_enabled=_bool("SOCIAL_CHAT_ENABLED", False),
+        social_chat_proactive_enabled=_bool("SOCIAL_CHAT_PROACTIVE_ENABLED", False),
+        social_chat_cooldown_minutes=int(os.getenv("SOCIAL_CHAT_COOLDOWN_MINUTES", "10")),
+        social_chat_hourly_limit=int(os.getenv("SOCIAL_CHAT_HOURLY_LIMIT", "3")),
         max_messages=int(os.getenv("MAX_MESSAGES", "2000")),
         max_chars_per_request=int(os.getenv("MAX_CHARS_PER_REQUEST", "50000")),
         db_path=Path(os.getenv("SUMMARY_DB_PATH", "./data/group_messages.sqlite3")),
