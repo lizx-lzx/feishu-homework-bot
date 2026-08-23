@@ -123,6 +123,7 @@ class Summarizer:
         *,
         system_prompt: str = SYSTEM_PROMPT,
         max_output_tokens: int = 6000,
+        temperature: float = 0.2,
     ) -> str:
         payload = {
             "model": self.model,
@@ -130,7 +131,7 @@ class Summarizer:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt},
             ],
-            "temperature": 0.2,
+            "temperature": temperature,
         }
         if self.model == "MiniMax-M3":
             # M3 defaults to adaptive thinking. A short legacy max_tokens value
@@ -180,6 +181,7 @@ class Summarizer:
             + command,
             system_prompt=LEADER_COMMAND_PROMPT,
             max_output_tokens=500,
+            temperature=0.0,
         )
         candidate = raw.strip()
         if candidate.startswith("```"):

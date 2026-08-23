@@ -118,6 +118,7 @@ def test_minimax_interprets_natural_leader_override_as_strict_json():
         assert "受限指令解析器" in payload["messages"][0]["content"]
         assert "卫安" in payload["messages"][1]["content"]
         assert payload["max_completion_tokens"] == 500
+        assert payload["temperature"] == 0.0
         return httpx.Response(
             200,
             json={
