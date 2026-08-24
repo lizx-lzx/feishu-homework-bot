@@ -605,6 +605,75 @@ def test_direct_mention_can_start_natural_course_chat(tmp_path):
     assert store.social_chat_action_sent("om_social_direct") is True
 
 
+def test_direct_mention_can_answer_ordinary_question_outside_course_scope(tmp_path):
+    original = make_settings(tmp_path)
+    settings = replace(original, social_chat_enabled=True)
+    api = FakeApi()
+    summarizer = FakeSocialSummarizer(
+        {
+            "action": "reply",
+            "reply": "想轻松一点可以看《银河系漫游指南》，它的幽默感很强。",
+            "emoji": None,
+            "confidence": 0.60,
+        }
+    )
+    store = LocalStore(settings.db_path)
+    service = GroupSummaryService(settings, api, summarizer, store)
+
+    service.handle_message(incoming("om_social_book", "@知识库助手 推荐一本适合周末看的科幻小说？"))
+
+    assert summarizer.social_calls[0][3] is True
+    assert api.replies[-1][2] == "social-chat-om_social_book"
+    assert "银河系漫游指南" in api.replies[-1][1]
+
+
+def test_direct_mention_uses_natural_fallback_when_social_model_stays_silent(tmp_path):
+    original = make_settings(tmp_path)
+    settings = replace(original, social_chat_enabled=True)
+    api = FakeApi()
+    summarizer = FakeSocialSummarizer(
+        {"action": "silent", "reply": "", "emoji": None, "confidence": 0.99}
+    )
+    store = LocalStore(settings.db_path)
+    service = GroupSummaryService(settings, api, summarizer, store)
+
+    service.handle_message(incoming("om_social_silent", "@知识库助手 你觉得这个怎么样？"))
+
+    assert "作业统计、群规则、项目卡点或普通问题" in api.replies[-1][1]
+    assert "只支持" not in api.replies[-1][1]
+
+
+def test_bot_explains_its_reminder_schedule_without_calling_social_model(tmp_path):
+    original = make_settings(tmp_path)
+    settings = replace(
+        original,
+        social_chat_enabled=True,
+        reminder_enabled=True,
+        reminder_hour=12,
+        missing_list_enabled=True,
+        missing_list_hour=17,
+        final_status_enabled=True,
+        final_status_hour=20,
+        makeup_reminder_enabled=True,
+        makeup_reminder_hour=17,
+        makeup_summary_enabled=True,
+        makeup_summary_hour=20,
+    )
+    api = FakeApi()
+    summarizer = FakeSocialSummarizer()
+    store = LocalStore(settings.db_path)
+    service = GroupSummaryService(settings, api, summarizer, store)
+
+    service.handle_message(incoming("om_reminder_what", "@知识库助手 你这个催交提醒是啥"))
+
+    reply = api.replies[-1][1]
+    assert "截止日：12:00 @ 尚未提交的成员" in reply
+    assert "17:00 发未交名单" in reply
+    assert "20:00 发完成/未完成汇总" in reply
+    assert "补交日：17:00 @ 仍未补交的成员" in reply
+    assert summarizer.social_calls == []
+
+
 def test_proactive_social_chat_only_considers_useful_signals(tmp_path):
     original = make_settings(tmp_path)
     settings = replace(

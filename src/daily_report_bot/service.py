@@ -68,6 +68,11 @@ _TABLE_LINK_INTENT = re.compile(
 _MENU_INTENT = re.compile(r"^(?:菜单|帮助|功能|怎么玩|能做什么|使用说明)$")
 _MY_STATS_INTENT = re.compile(r"我的战绩|我的打卡|我的作业|我还差什么|我还差啥|我这次.*(?:交|完成)")
 _WEEKLY_GROWTH_INTENT = re.compile(r"本周成长|成长卡|本周战报")
+_REMINDER_EXPLANATION_INTENT = re.compile(
+    r"(?:你这个|这个|刚才|自动)?(?:催交|催作业|补交|补卡|未交)?"
+    r"(?:提醒|通知).{0,10}(?:是啥|是什么|什么意思|怎么回事|干嘛|规则)"
+    r"|(?:催交|催作业|补交|补卡)(?:提醒|通知)(?:规则|机制)"
+)
 _FEEDBACK_REQUEST = re.compile(r"#\s*求反馈")
 _MENU_SHORTCUTS = {
     "1": "本次作业情况",
@@ -524,6 +529,43 @@ class GroupSummaryService:
         return f"本群打卡表：{self.settings.report_link}"
 
     @staticmethod
+    def _format_clock(hour: int, minute: int) -> str:
+        return f"{hour:02d}:{minute:02d}"
+
+    def _answer_reminder_explanation(self) -> str:
+        due_actions: List[str] = []
+        if self.settings.reminder_enabled:
+            due_actions.append(
+                f"{self._format_clock(self.settings.reminder_hour, self.settings.reminder_minute)} @ 尚未提交的成员"
+            )
+        if self.settings.missing_list_enabled:
+            due_actions.append(
+                f"{self._format_clock(self.settings.missing_list_hour, self.settings.missing_list_minute)} 发未交名单"
+            )
+        if self.settings.final_status_enabled:
+            due_actions.append(
+                f"{self._format_clock(self.settings.final_status_hour, self.settings.final_status_minute)} 发完成/未完成汇总"
+            )
+
+        makeup_actions: List[str] = []
+        if self.settings.makeup_reminder_enabled:
+            makeup_actions.append(
+                f"{self._format_clock(self.settings.makeup_reminder_hour, self.settings.makeup_reminder_minute)} @ 仍未补交的成员"
+            )
+        if self.settings.makeup_summary_enabled:
+            makeup_actions.append(
+                f"{self._format_clock(self.settings.makeup_summary_hour, self.settings.makeup_summary_minute)} 发补交汇总"
+            )
+
+        lines = ["这是机器人按当前作业周期自动发的催交，不是某个人手动点名。"]
+        if due_actions:
+            lines.append("截止日：" + "；".join(due_actions) + "。")
+        if makeup_actions:
+            lines.append("补交日：" + "；".join(makeup_actions) + "。")
+        lines.append("名单根据群内已识别的提交和打卡表状态生成；请假或误判可由组长在表里修正。")
+        return "\n".join(lines)
+
+    @staticmethod
     def _answer_menu() -> str:
         return (
             "🎮 作业助教菜单\n\n"
@@ -834,7 +876,7 @@ class GroupSummaryService:
         confidence = decision.get("confidence")
         if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
             return False
-        threshold = 0.72 if direct else 0.85 if action == "react" else 0.78
+        threshold = 0.50 if direct else 0.85 if action == "react" else 0.78
         if float(confidence) < threshold or action == "silent":
             return False
 
@@ -2322,6 +2364,13 @@ class GroupSummaryService:
                     f"weekly-growth-{message.message_id}",
                 )
                 return True
+            if _REMINDER_EXPLANATION_INTENT.search(mentioned_query):
+                self.api.reply_text(
+                    message.message_id,
+                    self._answer_reminder_explanation(),
+                    f"reminder-explanation-{message.message_id}",
+                )
+                return True
             leader_override = self._leader_override_request(mentioned_query)
             override_question = mentioned_query
             if leader_override is None and stored.sender_open_id in self.settings.leader_member_ids:
@@ -2387,7 +2436,13 @@ class GroupSummaryService:
                     direct=True,
                 ):
                     return True
-                reply = "我目前只支持查询作业、复盘、未交名单和日报。"
+                if self.settings.social_chat_enabled:
+                    reply = (
+                        "我在。刚才这句我没理解准，你换个说法再问一次；"
+                        "作业统计、群规则、项目卡点或普通问题都可以直接问。"
+                    )
+                else:
+                    reply = "我目前只支持查询作业、复盘、未交名单和日报。"
             if use_post:
                 self.api.reply_post(
                     message.message_id,
