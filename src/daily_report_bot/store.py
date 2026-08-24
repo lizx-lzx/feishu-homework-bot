@@ -47,6 +47,11 @@ class LocalStore:
                     chat_id TEXT PRIMARY KEY,
                     last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
+                CREATE TABLE IF NOT EXISTS sent_welcome_guides (
+                    chat_id TEXT PRIMARY KEY,
+                    message_id TEXT NOT NULL DEFAULT '',
+                    sent_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
                 CREATE TABLE IF NOT EXISTS sent_summaries (
                     report_date TEXT NOT NULL,
                     chat_id TEXT NOT NULL,
@@ -286,6 +291,32 @@ class LocalStore:
         with self._connect() as conn:
             rows = conn.execute("SELECT chat_id FROM known_chats ORDER BY chat_id").fetchall()
         return [str(row["chat_id"]) for row in rows]
+
+    def chat_known(self, chat_id: str) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM known_chats WHERE chat_id = ?",
+                (chat_id,),
+            ).fetchone()
+        return row is not None
+
+    def welcome_guide_sent(self, chat_id: str) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM sent_welcome_guides WHERE chat_id = ?",
+                (chat_id,),
+            ).fetchone()
+        return row is not None
+
+    def mark_welcome_guide_sent(self, chat_id: str, message_id: str) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO sent_welcome_guides(chat_id, message_id)
+                VALUES (?, ?)
+                """,
+                (chat_id, message_id),
+            )
 
     def summary_sent(self, report_date: str, chat_id: str) -> bool:
         with self._connect() as conn:

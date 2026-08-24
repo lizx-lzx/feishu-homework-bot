@@ -43,6 +43,11 @@ def _incoming(event: Any) -> IncomingMessage:
     )
 
 
+def _bot_added_chat_id(event: Any) -> str:
+    event_data = getattr(event, "event", None)
+    return str(getattr(event_data, "chat_id", "") or "")
+
+
 def _runtime(
     env_file: str,
 ) -> tuple[Any, FeishuApi, Summarizer, GroupServiceRouter]:
@@ -202,9 +207,22 @@ def run_bot(env_file: str) -> int:
     def on_message(event: Any) -> None:
         executor.submit(process, _incoming(event))
 
+    def process_bot_added(chat_id: str) -> None:
+        if not chat_id:
+            logger.warning("收到缺少 chat_id 的机器人入群事件")
+            return
+        try:
+            service.handle_bot_added(chat_id)
+        except Exception:
+            logger.exception("处理机器人入群事件失败：%s", chat_id)
+
+    def on_bot_added(event: Any) -> None:
+        executor.submit(process_bot_added, _bot_added_chat_id(event))
+
     handler = (
         lark.EventDispatcherHandler.builder("", "", lark.LogLevel.WARNING)
         .register_p2_im_message_receive_v1(on_message)
+        .register_p2_im_chat_member_bot_added_v1(on_bot_added)
         .build()
     )
 

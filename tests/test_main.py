@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 from daily_report_bot.main import (
+    _bot_added_chat_id,
     _incoming,
     _register_assignment_deadline_jobs,
     _register_final_status_job,
@@ -64,6 +65,13 @@ def test_incoming_keeps_topic_relationship_fields():
     assert result.parent_id == "om_root"
     assert result.root_id == "om_root"
     assert result.thread_id == "omt_topic"
+
+
+def test_bot_added_chat_id_reads_join_event():
+    event = SimpleNamespace(event=SimpleNamespace(chat_id="oc_new_group"))
+
+    assert _bot_added_chat_id(event) == "oc_new_group"
+    assert _bot_added_chat_id(SimpleNamespace(event=None)) == ""
 
 
 def test_capture_only_mode_registers_no_summary_job():

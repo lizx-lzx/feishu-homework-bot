@@ -1,5 +1,6 @@
 import json
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
@@ -248,6 +249,63 @@ def test_collects_group_messages_and_deduplicates(tmp_path):
     stored = store.list_messages("oc_group", 0, 9_999_999_999_999, 100)
     assert len(stored) == 1
     assert stored[0].sender_name == "小李"
+
+
+def test_new_group_welcome_guide_is_native_post_and_sent_once(tmp_path):
+    settings, api, _, store, service = make_service(tmp_path)
+
+    first = service.send_welcome_guide("oc_new")
+    second = service.send_welcome_guide("oc_new")
+
+    assert first == "om_summary"
+    assert second == ""
+    assert store.welcome_guide_sent("oc_new") is True
+    assert len(api.sent) == 1
+    chat_id, text, uuid = api.sent[0]
+    assert chat_id == "oc_new"
+    assert uuid == "welcome-guide-oc_new"
+    assert text.startswith("知识库助手・群内使用指南")
+    assert "前三次作业" in text
+    assert "图片内容" in text
+    assert f"[点击查看打卡表]({settings.report_link})" in text
+
+
+def test_concurrent_join_and_first_message_still_send_one_welcome_guide(tmp_path):
+    _, api, _, _, service = make_service(tmp_path)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _: service.send_welcome_guide("oc_new"), range(2)))
+
+    assert sorted(results) == ["", "om_summary"]
+    assert len(api.sent) == 1
+
+
+def test_welcome_guide_does_not_backfill_a_group_with_history(tmp_path):
+    _, api, _, store, service = make_service(tmp_path)
+    service.handle_message(incoming("om_old", "历史消息", chat_id="oc_existing"))
+
+    assert service.send_welcome_guide("oc_existing") == ""
+    assert api.sent == []
+    assert store.welcome_guide_sent("oc_existing") is True
+
+
+def test_router_uses_first_group_message_as_welcome_fallback(tmp_path):
+    chat_id = "oc_new"
+    settings = replace(
+        make_settings(tmp_path),
+        group_databases={chat_id: str(tmp_path / "group_new.sqlite3")},
+    )
+    api = FakeApi()
+    router = GroupServiceRouter(settings, api, FakeSummarizer())
+
+    assert router.handle_message(incoming("om_first", "第一条消息", chat_id=chat_id)) is True
+    assert router.handle_message(incoming("om_second", "第二条消息", chat_id=chat_id)) is True
+
+    assert len(api.sent) == 1
+    assert api.sent[0][0] == chat_id
+    service = router.service_for_chat(chat_id)
+    assert service is not None
+    assert service.store.welcome_guide_sent(chat_id) is True
 
 
 def test_homework_reaction_uses_cycle_stage_pools_and_is_idempotent(tmp_path, monkeypatch):

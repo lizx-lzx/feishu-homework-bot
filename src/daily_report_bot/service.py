@@ -7,6 +7,7 @@ import re
 from collections import Counter, defaultdict
 from datetime import date, datetime, time, timedelta
 from secrets import choice
+from threading import Lock
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .config import Settings
@@ -176,6 +177,7 @@ class GroupSummaryService:
         self._bot_name_loaded = False
         self._base_record_index: Dict[str, str] = {}
         self._base_index_loaded = False
+        self._welcome_guide_lock = Lock()
 
     def _chat_allowed(self, chat_id: str) -> bool:
         return not self.settings.chat_ids or chat_id in self.settings.chat_ids
@@ -2479,6 +2481,58 @@ class GroupSummaryService:
             ]
         )
         return "\n".join(lines)
+
+    def _welcome_guide_text(self) -> str:
+        lines = [
+            "知识库助手・群内使用指南",
+            "",
+            "👋 我会在本群记录作业、复盘和提交时间，并同步到本群独立的打卡表。",
+            "",
+            "✅ 怎么交作业",
+            "• 发图片、文件、成果链接或完整作业正文；建议写清“#日期 第N次作业已完成”。",
+            "• 复盘请带 #复盘；想要文字点评可再加 #求反馈。",
+            "• 补交按作业证据的真实发送时间判定；只说“我补交了”不会直接改状态。",
+            "• 图片会记录为作业证据，但不识别图片内容。",
+            "",
+            "🔎 @我可以问",
+            "• “谁还没交”、“第2次作业”、“前三次作业”",
+            "• “查询某人全部打卡记录”、“我的战绩”",
+            "• “打开打卡表”、“菜单”",
+            "",
+            "📌 需要我回复时请直接 @知识库助手；普通群聊默认只做记录。",
+        ]
+        if self.settings.report_link:
+            lines.extend(
+                [
+                    "",
+                    "📎 本群打卡表",
+                    f"[点击查看打卡表]({self.settings.report_link})",
+                ]
+            )
+        return "\n".join(lines)
+
+    def send_welcome_guide(self, chat_id: str, *, new_group_only: bool = True) -> str:
+        """机器人首次进入新群时发送一次指南。
+
+        历史数据库中已出现过的群不补发，避免上线功能时打扰现有群。
+        """
+        with self._welcome_guide_lock:
+            if not self.settings.send_enabled or not self._chat_allowed(chat_id):
+                return ""
+            if self.store.welcome_guide_sent(chat_id):
+                return ""
+            if new_group_only and self.store.chat_known(chat_id):
+                self.store.mark_welcome_guide_sent(chat_id, "")
+                logger.info("已有历史消息，不补发入群指南：chat=%s", chat_id)
+                return ""
+            message_id = self.api.send_post(
+                chat_id,
+                self._welcome_guide_text(),
+                f"welcome-guide-{chat_id}",
+            )
+            self.store.mark_welcome_guide_sent(chat_id, message_id)
+            logger.info("已发送新群使用指南：chat=%s message=%s", chat_id, message_id)
+            return message_id
 
     def handle_message(self, message: IncomingMessage) -> bool:
         if message.sender_type != "user" or message.chat_type != "group":

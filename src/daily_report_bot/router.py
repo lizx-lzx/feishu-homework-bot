@@ -137,7 +137,21 @@ class GroupServiceRouter:
         if service is None:
             logger.warning("忽略未配置数据库的群消息：%s", message.chat_id)
             return False
+        if not service.store.chat_known(message.chat_id) and not service.store.welcome_guide_sent(
+            message.chat_id
+        ):
+            try:
+                service.send_welcome_guide(message.chat_id, new_group_only=False)
+            except Exception:
+                logger.exception("新群第一条消息触发使用指南失败：%s", message.chat_id)
         return service.handle_message(message)
+
+    def handle_bot_added(self, chat_id: str) -> str:
+        service = self.service_for_chat(chat_id)
+        if service is None:
+            logger.warning("机器人进入了未配置数据库的群：%s", chat_id)
+            return ""
+        return service.send_welcome_guide(chat_id, new_group_only=True)
 
     def send_due_summaries(self, report_date: Optional[str] = None) -> List[SummaryResult]:
         results: List[SummaryResult] = []
