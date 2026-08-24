@@ -302,7 +302,8 @@ def test_minimax_homework_feedback_requires_three_fixed_lines():
 def test_minimax_decides_constrained_social_reply_with_context():
     def handler(request: httpx.Request) -> httpx.Response:
         payload = json.loads(request.content)
-        assert "有分寸的 AI 助教" in payload["messages"][0]["content"]
+        assert "有分寸、愿意交流的 AI 助教" in payload["messages"][0]["content"]
+        assert "作业推进、项目实操" in payload["messages"][0]["content"]
         assert "是否直接 @ 助教：yes" in payload["messages"][1]["content"]
         assert "页面部署后别人打不开" in payload["messages"][1]["content"]
         assert "群友甲：我也遇到过" in payload["messages"][1]["content"]

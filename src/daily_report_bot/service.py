@@ -91,6 +91,10 @@ _SOCIAL_PROACTIVE_SIGNAL = re.compile(
     r"|打不开|求助|帮我|有人知道|有没有办法|能不能|如何|哪位知道|终于|跑通了|搞定了"
     r"|部署好了|解决了|成功了"
 )
+_SOCIAL_WORK_DISCUSSION_SIGNAL = re.compile(
+    r"作业|课程|项目|页面|网站|代码|程序|部署|Cloudflare|"
+    r"Codex|GPT|MiniMax|AI\s*工具|提示词|排版|设计|参考图|工作流|自动化"
+)
 _SOCIAL_SKIP_SIGNAL = re.compile(
     r"#\s*(?:\d{4}|复盘|迭代|求反馈)|打开日报|已完成|已提交|补卡|补交|补提交"
 )
@@ -842,7 +846,10 @@ class GroupSummaryService:
                 prompt_text
             ):
                 return False
-            if not _SOCIAL_PROACTIVE_SIGNAL.search(prompt_text):
+            if not (
+                _SOCIAL_PROACTIVE_SIGNAL.search(prompt_text)
+                or _SOCIAL_WORK_DISCUSSION_SIGNAL.search(prompt_text)
+            ):
                 return False
             cooldown_ms = self.settings.social_chat_cooldown_minutes * 60 * 1000
             last_action_ms = self.store.last_social_chat_action_ms(message.chat_id)
@@ -876,7 +883,7 @@ class GroupSummaryService:
         confidence = decision.get("confidence")
         if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
             return False
-        threshold = 0.50 if direct else 0.85 if action == "react" else 0.78
+        threshold = 0.50 if direct else 0.85 if action == "react" else 0.68
         if float(confidence) < threshold or action == "silent":
             return False
 

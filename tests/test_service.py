@@ -694,7 +694,7 @@ def test_proactive_social_chat_only_considers_useful_signals(tmp_path):
     service = GroupSummaryService(settings, api, summarizer, store)
     daytime = datetime(2026, 8, 11, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
 
-    service.handle_message(incoming("om_social_plain", "今天课程很有意思", created_at=daytime))
+    service.handle_message(incoming("om_social_plain", "晚上吃什么好", created_at=daytime))
     assert summarizer.social_calls == []
 
     service.handle_message(
@@ -708,6 +708,39 @@ def test_proactive_social_chat_only_considers_useful_signals(tmp_path):
     assert len(summarizer.social_calls) == 1
     assert summarizer.social_calls[0][3] is False
     assert api.replies[-1][2] == "social-chat-om_social_help"
+
+
+def test_proactive_social_chat_can_join_course_work_discussion(tmp_path):
+    original = make_settings(tmp_path)
+    settings = replace(
+        original,
+        social_chat_enabled=True,
+        social_chat_proactive_enabled=True,
+    )
+    api = FakeApi()
+    summarizer = FakeSocialSummarizer(
+        {
+            "action": "reply",
+            "reply": "如果你是觉得首屏太空，可以先判断是信息层级不足，还是纯粹的间距问题。你现在更别扭的是标题区还是主视觉？",
+            "emoji": None,
+            "confidence": 0.70,
+        }
+    )
+    store = LocalStore(settings.db_path)
+    service = GroupSummaryService(settings, api, summarizer, store)
+
+    service.handle_message(
+        incoming(
+            "om_social_work_discussion",
+            "这个页面的留白有点多，但我还在想怎么调整",
+            created_at=datetime(2026, 8, 11, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+    )
+
+    assert len(summarizer.social_calls) == 1
+    assert summarizer.social_calls[0][3] is False
+    assert api.replies[-1][2] == "social-chat-om_social_work_discussion"
+    assert "信息层级" in api.replies[-1][1]
 
 
 def test_proactive_social_chat_uses_reaction_for_small_win(tmp_path):
