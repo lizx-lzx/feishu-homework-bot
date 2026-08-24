@@ -574,6 +574,128 @@ def test_weekly_growth_card_is_generated_only_on_demand(tmp_path):
     assert "🎯 全部准时：小李" in reply
 
 
+def test_multi_cycle_query_patterns_exclude_the_current_unfinished_cycle(tmp_path):
+    original = make_settings(tmp_path)
+    settings = replace(
+        original,
+        assignment_cycle_start_date="2026-08-17",
+        assignment_cycle_days=2,
+    )
+    service = GroupSummaryService(
+        settings,
+        FakeApi(),
+        FakeSummarizer(),
+        LocalStore(settings.db_path),
+    )
+    reference_day = datetime(2026, 8, 24).date()
+
+    assert service._multi_cycle_assignment_numbers("前三次作业", reference_day) == [
+        1,
+        2,
+        3,
+    ]
+    assert service._multi_cycle_assignment_numbers("这三次是否属实", reference_day) == [
+        1,
+        2,
+        3,
+    ]
+    assert service._multi_cycle_assignment_numbers("第1到3次作业", reference_day) == [
+        1,
+        2,
+        3,
+    ]
+    assert service._multi_cycle_assignment_numbers("技术周整体情况", reference_day) == [
+        1,
+        2,
+        3,
+    ]
+    assert service._multi_cycle_assignment_numbers("第三次作业", reference_day) is None
+
+
+def test_multi_cycle_query_reads_base_overrides_without_modifying_work_data(tmp_path):
+    original = make_settings(tmp_path)
+    settings = replace(
+        original,
+        assignment_cycle_start_date="2026-08-17",
+        assignment_cycle_days=2,
+        base_sync_enabled=True,
+        base_token="bas_test",
+        base_table_id="tbl_test",
+        report_members=("小李", "小王"),
+        member_aliases={"ou_1": "小李", "ou_2": "小王"},
+    )
+    api = FakeApi()
+    api.base_records = [
+        {
+            "record_id": "rec_manual_late",
+            "fields": {
+                "记录键": "2026-08-21|ou_1",
+                "组员姓名": "小李",
+                "作业状态": "未提交",
+                "人工状态": "补卡",
+            },
+        }
+    ]
+    store = LocalStore(settings.db_path)
+
+    def seed_cycle(report_date, first_status, second_status):
+        store.replace_daily_attendance(
+            [
+                AttendanceRecord(
+                    report_date=report_date,
+                    member_key="ou_1",
+                    sender_open_id="ou_1",
+                    sender_name="小李",
+                    assignment_label="作业",
+                    homework_status=first_status,
+                    review_status="missing",
+                    homework_source="tag",
+                ),
+                AttendanceRecord(
+                    report_date=report_date,
+                    member_key="ou_2",
+                    sender_open_id="ou_2",
+                    sender_name="小王",
+                    assignment_label="作业",
+                    homework_status=second_status,
+                    review_status="missing",
+                    homework_source="tag",
+                ),
+            ]
+        )
+
+    seed_cycle("2026-08-17", "completed", "completed")
+    seed_cycle("2026-08-19", "completed", "late")
+    seed_cycle("2026-08-21", "missing", "missing")
+    service = GroupSummaryService(settings, api, FakeSummarizer(), store)
+
+    service.handle_message(
+        incoming(
+            "om_multi_cycle_review",
+            "@知识库助手 你能复查一下这三次作业的情况吗，是否属实",
+            created_at=datetime(2026, 8, 24, 14, 3, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+    )
+
+    reply = api.replies[-1][1]
+    assert reply.startswith("📊 第1—3次作业复查（只读）")
+    assert "第1次（8月17日—8月18日）：正常 2｜补卡 0｜最终 2/2｜未交 0" in reply
+    assert "第2次（8月19日—8月20日）：正常 1｜补卡 1｜最终 2/2｜未交 0" in reply
+    assert "第3次（8月21日—8月22日）：正常 0｜补卡 1｜最终 1/2｜未交 1" in reply
+    assert "正常：小李、小王" in reply
+    assert "累计作业人次：正常 3｜补卡 2｜最终完成 5/6｜未交 1" in reply
+    assert "所选周期全部完成（1人）：小李" in reply
+    assert "本次查询没有修改任何表格数据" in reply
+    assert api.base_updates == []
+    assert len(api.base_records) == 1
+    stored = {
+        record.sender_name: record.homework_status
+        for record in store.list_daily_attendance("2026-08-21")
+    }
+    assert stored == {"小李": "missing", "小王": "missing"}
+    assert api.replies[-1][2] == "multi-cycle-stats-om_multi_cycle_review"
+
+
 def test_direct_mention_can_start_natural_course_chat(tmp_path):
     original = make_settings(tmp_path)
     settings = replace(original, social_chat_enabled=True)

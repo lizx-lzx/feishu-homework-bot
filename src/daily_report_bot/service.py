@@ -50,6 +50,18 @@ _THREAD_ASSIGNMENT_LABEL = re.compile(r"(?P<label>第\s*\d+\s*次\s*作业)")
 _ASSIGNMENT_NUMBER = re.compile(
     r"第\s*(?P<number>\d+|[一二三四五六七八九十]+)\s*(?:次(?:\s*作业)?|作业)"
 )
+_ASSIGNMENT_RANGE = re.compile(
+    r"第\s*(?P<start>\d+|[一二三四五六七八九十]+)\s*"
+    r"(?:次(?:\s*作业)?)?\s*(?:到|至|[-—~～])\s*(?:第\s*)?"
+    r"(?P<end>\d+|[一二三四五六七八九十]+)\s*次(?:\s*作业)?"
+)
+_FIRST_ASSIGNMENTS = re.compile(
+    r"前\s*(?P<count>\d+|[一二三四五六七八九十]+)\s*次(?:\s*作业)?"
+)
+_RECENT_ASSIGNMENTS = re.compile(
+    r"这\s*(?P<count>\d+|[一二三四五六七八九十]+)\s*次(?:\s*作业)?"
+)
+_TECH_WEEK_OVERVIEW = re.compile(r"技术周(?:整体|全部|总览|汇总|打卡情况|作业情况)?")
 _ASSIGNMENT_LABEL_ONLY = re.compile(
     r"^第\s*(?P<number>\d+|[一二三四五六七八九十]+)\s*(?:次\s*)?作业$"
 )
@@ -81,6 +93,7 @@ _MENU_SHORTCUTS = {
     "4": "本次作业补卡情况",
     "5": "本周成长卡",
     "6": "打开打卡表",
+    "7": "前三次作业复查",
 }
 _SEMANTIC_STATS_SIGNAL = re.compile(
     r"掉队|没跟上|还差|进度|战绩|第\s*[0-9一二三四五六七八九十]+\s*次"
@@ -283,6 +296,204 @@ class GroupSummaryService:
             except ValueError:
                 return reference_day.isoformat()
         return reference_day.isoformat()
+
+    def _multi_cycle_assignment_numbers(
+        self,
+        question: str,
+        reference_day: date,
+    ) -> Optional[List[int]]:
+        """把明确的多周期问法转成作业序号。
+
+        “前 N 次”指从课程开始的前 N 期；“这 N 次”和“技术周”
+        只取当前周期之前的已结束周期，避免把正在提交的作业混进复查。
+        """
+        if not self.settings.assignment_cycle_start_date:
+            return None
+        _, _, current_assignment = self.settings.assignment_cycle(reference_day)
+
+        match = _ASSIGNMENT_RANGE.search(question)
+        if match:
+            start = self._parse_assignment_number(match.group("start"))
+            end = self._parse_assignment_number(match.group("end"))
+            if start < 1 or end < start or end > current_assignment or end - start >= 12:
+                return []
+            return list(range(start, end + 1))
+
+        match = _FIRST_ASSIGNMENTS.search(question)
+        if match:
+            count = self._parse_assignment_number(match.group("count"))
+            last_completed = current_assignment - 1
+            if count < 1 or count > 12 or last_completed < 1:
+                return []
+            return list(range(1, min(count, last_completed) + 1))
+
+        match = _RECENT_ASSIGNMENTS.search(question)
+        if match:
+            count = self._parse_assignment_number(match.group("count"))
+            last_completed = current_assignment - 1
+            if count < 1 or count > 12 or last_completed < 1:
+                return []
+            start = max(1, last_completed - count + 1)
+            return list(range(start, last_completed + 1))
+
+        if _TECH_WEEK_OVERVIEW.search(question) and not _ASSIGNMENT_NUMBER.search(question):
+            if current_assignment <= 1:
+                return []
+            return list(range(1, current_assignment))
+        return None
+
+    def _multi_cycle_base_statuses(
+        self,
+        report_dates: Sequence[str],
+    ) -> Dict[Tuple[str, str], str]:
+        """只读多维表格的系统/人工状态，不回写任何字段。"""
+        if not self.settings.base_sync_enabled:
+            return {}
+        wanted = set(report_dates)
+        system_statuses = {"已提交": "completed", "补卡": "late", "未提交": "missing"}
+        statuses: Dict[Tuple[str, str], str] = {}
+        for record in self.api.list_base_records(
+            self.settings.base_token,
+            self.settings.base_table_id,
+        ):
+            fields = record.get("fields") or {}
+            record_key = self._base_cell_text(fields.get("记录键"))
+            if "|" not in record_key:
+                continue
+            report_date = record_key.split("|", 1)[0]
+            if report_date not in wanted:
+                continue
+            name = self._base_cell_text(fields.get("组员姓名"))
+            if not name:
+                continue
+            manual_value = self._base_cell_text(fields.get("人工状态"))
+            system_value = self._base_cell_text(fields.get("作业状态"))
+            status = _MANUAL_ATTENDANCE_STATUS.get(manual_value) or system_statuses.get(
+                system_value
+            )
+            if status:
+                statuses[(report_date, name)] = status
+        return statuses
+
+    def _answer_multi_cycle_stats(
+        self,
+        question: str,
+        reference_day: date,
+    ) -> Optional[str]:
+        assignment_numbers = self._multi_cycle_assignment_numbers(question, reference_day)
+        if assignment_numbers is None:
+            return None
+        if not assignment_numbers:
+            _, _, current_assignment = self.settings.assignment_cycle(reference_day)
+            return f"当前最多只能复查到第{current_assignment}次作业，没有匹配的多周期范围。"
+
+        course_start = datetime.strptime(
+            self.settings.assignment_cycle_start_date,
+            "%Y-%m-%d",
+        ).date()
+        report_dates = [
+            (
+                course_start
+                + timedelta(
+                    days=(assignment_number - 1) * self.settings.assignment_cycle_days
+                )
+            ).isoformat()
+            for assignment_number in assignment_numbers
+        ]
+        try:
+            base_statuses = self._multi_cycle_base_statuses(report_dates)
+        except Exception:
+            logger.exception("多周期复查读取多维表格失败")
+            return "多维表格当前读取失败，为避免用旧数据误报，本次没有给出复查结果。"
+
+        normal_total = 0
+        late_total = 0
+        missing_total = 0
+        slot_total = 0
+        status_history: Dict[str, List[str]] = defaultdict(list)
+        lines = [
+            f"📊 第{assignment_numbers[0]}—{assignment_numbers[-1]}次作业复查（只读）",
+            "",
+        ]
+        available_cycles = 0
+        for assignment_number, report_date in zip(assignment_numbers, report_dates):
+            records = self.store.list_daily_attendance(report_date)
+            status_by_name = {
+                record.sender_name: record.homework_status
+                for record in records
+                if record.sender_name in self.settings.report_members
+            }
+            status_by_name.update(
+                {
+                    name: status
+                    for (row_date, name), status in base_statuses.items()
+                    if row_date == report_date and name in self.settings.report_members
+                }
+            )
+            if not status_by_name:
+                lines.extend([f"第{assignment_number}次：暂无可核验的已存打卡数据。", ""])
+                continue
+
+            available_cycles += 1
+            active_names = [
+                name
+                for name in self.settings.report_members
+                if status_by_name.get(name, "missing") != "excluded"
+            ]
+            normal = [
+                name for name in active_names if status_by_name.get(name) == "completed"
+            ]
+            late = [name for name in active_names if status_by_name.get(name) == "late"]
+            missing = [
+                name
+                for name in active_names
+                if status_by_name.get(name, "missing") == "missing"
+            ]
+            for name in self.settings.report_members:
+                status_history[name].append(status_by_name.get(name, "missing"))
+
+            normal_total += len(normal)
+            late_total += len(late)
+            missing_total += len(missing)
+            slot_total += len(active_names)
+            cycle_start, cycle_end, _ = self.settings.assignment_cycle(report_date)
+            period = f"{cycle_start.month}月{cycle_start.day}日—{cycle_end.month}月{cycle_end.day}日"
+            lines.extend(
+                [
+                    f"第{assignment_number}次（{period}）：正常 {len(normal)}｜补卡 {len(late)}｜"
+                    f"最终 {len(normal) + len(late)}/{len(active_names)}｜未交 {len(missing)}",
+                    f"正常：{self._names(normal)}",
+                    f"补卡：{self._names(late)}",
+                    f"未交：{self._names(missing)}",
+                    "",
+                ]
+            )
+
+        if not available_cycles:
+            return "所选作业周期暂无可核验的已存打卡数据。"
+
+        fully_completed = [
+            name
+            for name in self.settings.report_members
+            if len(status_history[name]) == available_cycles
+            and all(status in {"completed", "late"} for status in status_history[name])
+        ]
+        lines.extend(
+            [
+                "多周期总览",
+                f"累计作业人次：正常 {normal_total}｜补卡 {late_total}｜"
+                f"最终完成 {normal_total + late_total}/{slot_total}｜未交 {missing_total}",
+                f"所选周期全部完成（{len(fully_completed)}人）：{self._names(fully_completed)}",
+                "",
+                (
+                    "数据来源：本地打卡记录 + 多维表格当前状态；"
+                    "本次查询没有修改任何表格数据。"
+                    if self.settings.base_sync_enabled
+                    else "数据来源：本地打卡记录；本次查询没有修改任何数据。"
+                ),
+            ]
+        )
+        return "\n".join(lines)
 
     def _named_messages(self, report_date: str, chat_id: str) -> List[StoredMessage]:
         messages = self._load_messages(report_date, chat_id)
@@ -579,7 +790,8 @@ class GroupSummaryService:
             "3  我的战绩\n"
             "4  补卡情况\n"
             "5  本周成长卡\n"
-            "6  打开打卡表\n\n"
+            "6  打开打卡表\n"
+            "7  前三次作业复查\n\n"
             "也可直接说：“第三次还有谁掉队了”。\n"
             "交作业时加 #求反馈，我会根据文字给三行点评。"
         )
@@ -2369,6 +2581,17 @@ class GroupSummaryService:
                     message.message_id,
                     self._answer_weekly_growth(submitted_at.date(), message.chat_id),
                     f"weekly-growth-{message.message_id}",
+                )
+                return True
+            multi_cycle_reply = self._answer_multi_cycle_stats(
+                mentioned_query,
+                submitted_at.date(),
+            )
+            if multi_cycle_reply is not None:
+                self.api.reply_post(
+                    message.message_id,
+                    multi_cycle_reply,
+                    f"multi-cycle-stats-{message.message_id}",
                 )
                 return True
             if _REMINDER_EXPLANATION_INTENT.search(mentioned_query):
