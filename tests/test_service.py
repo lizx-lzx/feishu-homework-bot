@@ -217,7 +217,10 @@ def with_video_week(settings: Settings) -> Settings:
                 start_date="2026-08-28",
                 cycle_days=1,
                 publish_hour=8,
-                due_hour=20,
+                due_day_offset=1,
+                due_hour=12,
+                makeup_day_offset=0,
+                makeup_hour=22,
             ),
         ),
     )
@@ -873,7 +876,7 @@ def test_bot_explains_its_reminder_schedule_without_calling_social_model(tmp_pat
     assert "截止日：12:00 @ 尚未提交的成员" in reply
     assert "17:00 发未交名单" in reply
     assert "20:00 发完成/未完成汇总" in reply
-    assert "补交日：17:00 @ 仍未补交的成员" in reply
+    assert "补交阶段：17:00 @ 仍未补交的成员" in reply
     assert summarizer.social_calls == []
 
 
@@ -3053,11 +3056,81 @@ def test_video_week_is_an_independent_daily_course_phase(tmp_path):
         2,
     )
     assert settings.assignment_publish_clock("2026-08-28") == (8, 0)
-    assert settings.assignment_due_clock("2026-08-28") == (20, 0)
-    assert settings.is_assignment_due_day("2026-08-28") is True
+    assert settings.assignment_due_clock("2026-08-28") == (12, 0)
+    assert settings.assignment_deadline("2026-08-28").isoformat() == ("2026-08-29T12:00:00+08:00")
+    assert settings.makeup_deadline("2026-08-28").isoformat() == ("2026-08-29T22:00:00+08:00")
+    assert settings.is_assignment_due_day("2026-08-28") is False
+    assert settings.is_assignment_due_day("2026-08-29") is True
+    assert settings.assignment_due_report_date("2026-08-29") == "2026-08-28"
     assert settings.is_makeup_day("2026-08-28") is False
     assert settings.is_makeup_day("2026-08-29") is True
     assert settings.makeup_report_date("2026-08-29") == "2026-08-28"
+
+
+def test_daily_phase_classifies_next_day_noon_and_ten_pm_boundaries(tmp_path):
+    original = make_settings(tmp_path)
+    settings = replace(
+        original,
+        course_phases=(
+            CoursePhase(
+                name="视频周",
+                start_date="2026-08-20",
+                cycle_days=1,
+                publish_hour=8,
+                due_day_offset=1,
+                due_hour=12,
+                makeup_day_offset=0,
+                makeup_hour=22,
+            ),
+        ),
+        report_members=("正常成员", "补交成员", "超时成员"),
+        member_aliases={
+            **original.member_aliases,
+            "ou_1": "正常成员",
+            "ou_2": "补交成员",
+            "ou_3": "超时成员",
+        },
+    )
+    store = LocalStore(settings.db_path)
+    service = GroupSummaryService(settings, FakeApi(), FakeSummarizer(), store)
+    submissions = (
+        (
+            "om_normal_before_noon",
+            "#0825 第6次作业已完成\n作业说明：正常提交",
+            "ou_1",
+            datetime(2026, 8, 26, 11, 59, tzinfo=ZoneInfo("Asia/Shanghai")),
+        ),
+        (
+            "om_makeup_after_noon",
+            "#0825 第6次作业已完成\n作业说明：补交",
+            "ou_2",
+            datetime(2026, 8, 26, 12, 1, tzinfo=ZoneInfo("Asia/Shanghai")),
+        ),
+        (
+            "om_too_late_at_ten",
+            "#0825 第6次作业已完成\n作业说明：超时提交",
+            "ou_3",
+            datetime(2026, 8, 26, 22, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        ),
+    )
+    for message_id, text, sender_open_id, created_at in submissions:
+        service.handle_message(
+            incoming(
+                message_id,
+                text,
+                sender_open_id=sender_open_id,
+                created_at=created_at,
+            )
+        )
+
+    service.sync_attendance_date("2026-08-25", "oc_group")
+
+    attendance = {
+        record.sender_name: record for record in store.list_daily_attendance("2026-08-25")
+    }
+    assert attendance["正常成员"].homework_status == "completed"
+    assert attendance["补交成员"].homework_status == "late"
+    assert attendance["超时成员"].homework_status == "missing"
 
 
 def test_assignment_number_uses_current_or_named_course_phase(tmp_path):
@@ -3082,13 +3155,21 @@ def test_assignment_number_uses_current_or_named_course_phase(tmp_path):
 
 
 def test_video_week_submission_and_makeup_use_expected_reactions(tmp_path, monkeypatch):
-    original = with_video_week(make_settings(tmp_path))
+    original = make_settings(tmp_path)
     settings = replace(
         original,
         homework_reaction_enabled=True,
         course_phases=(
-            original.course_phases[0],
-            replace(original.course_phases[1], due_hour=12),
+            CoursePhase(
+                name="视频周",
+                start_date="2026-08-20",
+                cycle_days=1,
+                publish_hour=8,
+                due_day_offset=1,
+                due_hour=12,
+                makeup_day_offset=0,
+                makeup_hour=22,
+            ),
         ),
     )
     api = FakeApi()
@@ -3096,28 +3177,33 @@ def test_video_week_submission_and_makeup_use_expected_reactions(tmp_path, monke
     service = GroupSummaryService(settings, api, FakeSummarizer(), store)
     monkeypatch.setattr("daily_report_bot.service.choice", lambda values: values[-1])
 
-    assert service.handle_message(
-        incoming(
-            "om_video_normal",
-            "#8月28日 第1次作业已完成\n作业说明：已完成视频练习",
-            created_at=datetime(2026, 8, 28, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+    assert (
+        service.handle_message(
+            incoming(
+                "om_video_normal",
+                "#8月20日 第1次作业已完成\n作业说明：已完成视频练习",
+                created_at=datetime(2026, 8, 20, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+            )
         )
-    ) is True
+        is True
+    )
     assert api.reactions[-1] == ("om_video_normal", "FINGERHEART")
 
-    assert service.handle_message(
-        incoming(
-            "om_video_makeup",
-            "#8月28日 第1次作业已补交\n作业说明：已补交视频练习",
-            sender_open_id="ou_2",
-            created_at=datetime(2026, 8, 28, 13, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+    assert (
+        service.handle_message(
+            incoming(
+                "om_video_makeup",
+                "#8月20日 第1次作业已补交\n作业说明：已补交视频练习",
+                sender_open_id="ou_2",
+                created_at=datetime(2026, 8, 21, 13, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+            )
         )
-    ) is True
+        is True
+    )
     assert api.reactions[-1] == ("om_video_makeup", "Get")
 
     attendance = {
-        record.sender_name: record
-        for record in store.list_daily_attendance("2026-08-28")
+        record.sender_name: record for record in store.list_daily_attendance("2026-08-20")
     }
     assert attendance["小李"].homework_status == "completed"
     assert attendance["小王"].homework_status == "late"
@@ -3176,10 +3262,13 @@ def test_completion_question_is_not_treated_as_submission(tmp_path):
         LocalStore(settings.db_path),
     )
 
-    assert service._submission_report_dates(
-        "#8月28日 第1次作业完成情况怎么样",
-        date(2026, 8, 28),
-    ) == []
+    assert (
+        service._submission_report_dates(
+            "#8月28日 第1次作业完成情况怎么样",
+            date(2026, 8, 28),
+        )
+        == []
+    )
 
 
 def test_gap_day_media_is_not_recorded_as_homework(tmp_path):

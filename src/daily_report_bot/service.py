@@ -57,12 +57,8 @@ _ASSIGNMENT_RANGE = re.compile(
     r"(?:次(?:\s*作业)?)?\s*(?:到|至|[-—~～])\s*(?:第\s*)?"
     r"(?P<end>\d+|[一二三四五六七八九十]+)\s*次(?:\s*作业)?"
 )
-_FIRST_ASSIGNMENTS = re.compile(
-    r"前\s*(?P<count>\d+|[一二三四五六七八九十]+)\s*次(?:\s*作业)?"
-)
-_RECENT_ASSIGNMENTS = re.compile(
-    r"这\s*(?P<count>\d+|[一二三四五六七八九十]+)\s*次(?:\s*作业)?"
-)
+_FIRST_ASSIGNMENTS = re.compile(r"前\s*(?P<count>\d+|[一二三四五六七八九十]+)\s*次(?:\s*作业)?")
+_RECENT_ASSIGNMENTS = re.compile(r"这\s*(?P<count>\d+|[一二三四五六七八九十]+)\s*次(?:\s*作业)?")
 _TECH_WEEK_OVERVIEW = re.compile(r"技术周(?:整体|全部|总览|汇总|打卡情况|作业情况)?")
 _VIDEO_WEEK_OVERVIEW = re.compile(r"视频周(?:整体|全部|总览|汇总|打卡情况|作业情况)?")
 _ASSIGNMENT_LABEL_ONLY = re.compile(
@@ -333,9 +329,7 @@ class GroupSummaryService:
             return None
         total = self.settings.total_assignment_cycles(reference_day, course_name)
         if total is None:
-            _, _, current_assignment = self.settings.assignment_cycle_in_phase(
-                reference_day, phase
-            )
+            _, _, current_assignment = self.settings.assignment_cycle_in_phase(reference_day, phase)
             return (
                 f"{phase.name}从{phase.start_date}开始，"
                 f"目前进行到第{current_assignment}次作业，"
@@ -362,15 +356,9 @@ class GroupSummaryService:
         )
         if phase is None:
             return None
-        _, _, current_assignment = self.settings.assignment_cycle_in_phase(
-            reference_day, phase
-        )
+        _, _, current_assignment = self.settings.assignment_cycle_in_phase(reference_day, phase)
         phase_ended = phase.end_day is not None and reference_day > phase.end_day
-        last_completed = (
-            current_assignment
-            if phase_ended
-            else current_assignment - 1
-        )
+        last_completed = current_assignment if phase_ended else current_assignment - 1
 
         match = _ASSIGNMENT_RANGE.search(question)
         if match:
@@ -451,17 +439,12 @@ class GroupSummaryService:
         if phase is None:
             return "本群还没有配置对应的作业周期。"
         if not assignment_numbers:
-            _, _, current_assignment = self.settings.assignment_cycle_in_phase(
-                reference_day, phase
-            )
+            _, _, current_assignment = self.settings.assignment_cycle_in_phase(reference_day, phase)
             return f"当前最多只能复查到第{current_assignment}次作业，没有匹配的多周期范围。"
 
         report_dates = [
             (
-                phase.start_day
-                + timedelta(
-                    days=(assignment_number - 1) * phase.cycle_days
-                )
+                phase.start_day + timedelta(days=(assignment_number - 1) * phase.cycle_days)
             ).isoformat()
             for assignment_number in assignment_numbers
         ]
@@ -513,14 +496,10 @@ class GroupSummaryService:
                 for name in self.settings.report_members
                 if status_by_name.get(name, "missing") != "excluded"
             ]
-            normal = [
-                name for name in active_names if status_by_name.get(name) == "completed"
-            ]
+            normal = [name for name in active_names if status_by_name.get(name) == "completed"]
             late = [name for name in active_names if status_by_name.get(name) == "late"]
             missing = [
-                name
-                for name in active_names
-                if status_by_name.get(name, "missing") == "missing"
+                name for name in active_names if status_by_name.get(name, "missing") == "missing"
             ]
             for name in self.settings.report_members:
                 status_history[name].append(status_by_name.get(name, "missing"))
@@ -530,7 +509,9 @@ class GroupSummaryService:
             missing_total += len(missing)
             slot_total += len(active_names)
             cycle_start, cycle_end, _ = self.settings.assignment_cycle(report_date)
-            period = f"{cycle_start.month}月{cycle_start.day}日—{cycle_end.month}月{cycle_end.day}日"
+            period = (
+                f"{cycle_start.month}月{cycle_start.day}日—{cycle_end.month}月{cycle_end.day}日"
+            )
             lines.extend(
                 [
                     f"第{assignment_number}次（{period}）：正常 {len(normal)}｜补卡 {len(late)}｜"
@@ -559,8 +540,7 @@ class GroupSummaryService:
                 f"所选周期全部完成（{len(fully_completed)}人）：{self._names(fully_completed)}",
                 "",
                 (
-                    "数据来源：本地打卡记录 + 多维表格当前状态；"
-                    "本次查询没有修改任何表格数据。"
+                    "数据来源：本地打卡记录 + 多维表格当前状态；本次查询没有修改任何表格数据。"
                     if self.settings.base_sync_enabled
                     else "数据来源：本地打卡记录；本次查询没有修改任何数据。"
                 ),
@@ -598,8 +578,9 @@ class GroupSummaryService:
         cutoff_hour: int,
         cutoff_minute: int,
     ) -> List[StoredMessage]:
-        cycle_start, due_day, _ = self.settings.assignment_cycle(report_date)
+        cycle_start, _, _ = self.settings.assignment_cycle(report_date)
         report_date = cycle_start.isoformat()
+        due_day = self.settings.assignment_deadline(report_date).date()
         window_start_day = cycle_start
         if not self.settings.configured_course_phases:
             window_start_day -= timedelta(days=1)
@@ -844,15 +825,25 @@ class GroupSummaryService:
         lines = ["这是机器人按当前作业周期自动发的催交，不是某个人手动点名。"]
         today = datetime.now(tz=self.settings.tz).date()
         if phase := self.settings.course_phase(today):
+            if phase.due_day_offset is not None:
+                due_day_label = (
+                    "当日"
+                    if phase.due_day_offset == 0
+                    else "次日"
+                    if phase.due_day_offset == 1
+                    else f"第{phase.due_day_offset + 1}天"
+                )
+            else:
+                due_day_label = f"第{phase.cycle_days}天"
             lines.append(
                 f"当前为{phase.name}：每{phase.cycle_days}天一次作业，"
                 f"{self._format_clock(phase.publish_hour, phase.publish_minute)}开始，"
-                f"{self._format_clock(phase.due_hour, phase.due_minute)}截止。"
+                f"{due_day_label}{self._format_clock(phase.due_hour, phase.due_minute)}正常截止。"
             )
         if due_actions:
             lines.append("截止日：" + "；".join(due_actions) + "。")
         if makeup_actions:
-            lines.append("补交日：" + "；".join(makeup_actions) + "。")
+            lines.append("补交阶段：" + "；".join(makeup_actions) + "。")
         lines.append("名单根据群内已识别的提交和打卡表状态生成；请假或误判可由组长在表里修正。")
         return "\n".join(lines)
 
@@ -879,13 +870,11 @@ class GroupSummaryService:
             if phase.end_day is not None and today > phase.end_day:
                 total = self.settings.total_assignment_cycles(today, phase.name)
                 course_lines.append(
-                    f"{phase.name}：{phase.start_date}—{phase.end_date}"
-                    f"（已结束，共{total}次作业）"
+                    f"{phase.name}：{phase.start_date}—{phase.end_date}（已结束，共{total}次作业）"
                 )
             elif phase.contains(today):
                 course_lines.append(
-                    f"{phase.name}：{phase.start_date}起进行中，"
-                    f"每{phase.cycle_days}天一次作业"
+                    f"{phase.name}：{phase.start_date}起进行中，每{phase.cycle_days}天一次作业"
                 )
             else:
                 course_lines.append(f"{phase.name}：{phase.start_date}起开始")
@@ -1269,9 +1258,7 @@ class GroupSummaryService:
                 current_cycle_start, _, _ = self.settings.assignment_cycle(current_report_date)
                 report_date = (
                     current_cycle_start
-                    - timedelta(
-                        days=self.settings.assignment_cycle_days_for(current_report_date)
-                    )
+                    - timedelta(days=self.settings.assignment_cycle_days_for(current_report_date))
                 ).isoformat()
         self.sync_attendance_date(report_date, message.chat_id)
         records = self.api.list_base_records(
@@ -1367,9 +1354,7 @@ class GroupSummaryService:
             self._course_name_hint(question),
         )
         if phase is not None and phase.end_day is not None and reference_day > phase.end_day:
-            day_label = (
-                f"{phase.name}已于{phase.end_date}结束；以下为历史记录。\n{day_label}"
-            )
+            day_label = f"{phase.name}已于{phase.end_date}结束；以下为历史记录。\n{day_label}"
         wants_review = "复盘" in question
         wants_homework = bool(re.search(r"作业|打卡|提交|没交|未交", question))
         if wants_review and not wants_homework:
@@ -1792,9 +1777,8 @@ class GroupSummaryService:
                 )
                 if target is None or target > candidate:
                     continue
-            elif (
-                self.settings.configured_course_phases
-                and not self.settings.course_is_active(candidate)
+            elif self.settings.configured_course_phases and not self.settings.course_is_active(
+                candidate
             ):
                 continue
             report_dates.add(self._marker_report_date(candidate, label))
@@ -2982,9 +2966,8 @@ class GroupSummaryService:
         return lines
 
     def build_summary(self, report_date: str, chat_id: str) -> Optional[SummaryResult]:
-        if (
-            self.settings.configured_course_phases
-            and not self.settings.course_is_active(report_date)
+        if self.settings.configured_course_phases and not self.settings.course_is_active(
+            report_date
         ):
             logger.info("当天不在已配置的课程阶段内，不生成日报：%s", report_date)
             return None
@@ -3186,10 +3169,10 @@ class GroupSummaryService:
         if not self.settings.send_enabled or not self.settings.reminder_enabled:
             return []
         day = report_date or datetime.now(tz=self.settings.tz).date().isoformat()
-        if not self.settings.is_assignment_due_day(day):
+        assignment_date = self.settings.assignment_due_report_date(day)
+        if assignment_date is None:
             logger.info("今天不是作业截止日，跳过催交：%s", day)
             return []
-        assignment_date = self.settings.assignment_report_date(day)
         message_ids: List[str] = []
         for chat_id in sorted(set(self.settings.chat_ids) | set(self.store.list_chats())):
             try:
@@ -3244,10 +3227,10 @@ class GroupSummaryService:
         if not self.settings.send_enabled or not self.settings.missing_list_enabled:
             return []
         day = report_date or datetime.now(tz=self.settings.tz).date().isoformat()
-        if not self.settings.is_assignment_due_day(day):
+        assignment_date = self.settings.assignment_due_report_date(day)
+        if assignment_date is None:
             logger.info("今天不是作业截止日，跳过未交名单：%s", day)
             return []
-        assignment_date = self.settings.assignment_report_date(day)
         message_ids: List[str] = []
         for chat_id in sorted(set(self.settings.chat_ids) | set(self.store.list_chats())):
             try:
@@ -3302,10 +3285,10 @@ class GroupSummaryService:
         if not self.settings.send_enabled or not self.settings.final_status_enabled:
             return []
         day = report_date or datetime.now(tz=self.settings.tz).date().isoformat()
-        if not self.settings.is_assignment_due_day(day):
+        assignment_date = self.settings.assignment_due_report_date(day)
+        if assignment_date is None:
             logger.info("今天不是作业截止日，跳过最终汇总：%s", day)
             return []
-        assignment_date = self.settings.assignment_report_date(day)
         message_ids: List[str] = []
         for chat_id in sorted(set(self.settings.chat_ids) | set(self.store.list_chats())):
             try:

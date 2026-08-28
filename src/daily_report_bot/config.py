@@ -112,6 +112,10 @@ class CoursePhase:
     publish_minute: int = 0
     due_hour: int = 20
     due_minute: int = 0
+    due_day_offset: Optional[int] = None
+    makeup_day_offset: int = 1
+    makeup_hour: Optional[int] = None
+    makeup_minute: Optional[int] = None
 
     @property
     def start_day(self) -> date:
@@ -147,6 +151,10 @@ def _load_course_phases() -> Tuple[CoursePhase, ...]:
         "publish_minute",
         "due_hour",
         "due_minute",
+        "due_day_offset",
+        "makeup_day_offset",
+        "makeup_hour",
+        "makeup_minute",
     }
     for index, item in enumerate(parsed, start=1):
         if not isinstance(item, dict):
@@ -154,8 +162,7 @@ def _load_course_phases() -> Tuple[CoursePhase, ...]:
         unknown = set(item) - allowed
         if unknown:
             raise ConfigurationError(
-                f"COURSE_PHASES_JSON 第 {index} 项包含未知字段："
-                + ", ".join(sorted(unknown))
+                f"COURSE_PHASES_JSON 第 {index} 项包含未知字段：" + ", ".join(sorted(unknown))
             )
         try:
             phases.append(
@@ -168,12 +175,24 @@ def _load_course_phases() -> Tuple[CoursePhase, ...]:
                     publish_minute=int(item.get("publish_minute", 0)),
                     due_hour=int(item.get("due_hour", 20)),
                     due_minute=int(item.get("due_minute", 0)),
+                    due_day_offset=(
+                        int(item["due_day_offset"])
+                        if item.get("due_day_offset") is not None
+                        else None
+                    ),
+                    makeup_day_offset=int(item.get("makeup_day_offset", 1)),
+                    makeup_hour=(
+                        int(item["makeup_hour"]) if item.get("makeup_hour") is not None else None
+                    ),
+                    makeup_minute=(
+                        int(item["makeup_minute"])
+                        if item.get("makeup_minute") is not None
+                        else None
+                    ),
                 )
             )
         except (TypeError, ValueError) as exc:
-            raise ConfigurationError(
-                f"COURSE_PHASES_JSON 第 {index} 项的数字字段不合法"
-            ) from exc
+            raise ConfigurationError(f"COURSE_PHASES_JSON 第 {index} 项的数字字段不合法") from exc
     return tuple(phases)
 
 
@@ -223,12 +242,12 @@ class Settings:
     final_status_hour: int = 20
     final_status_minute: int = 0
     makeup_reminder_enabled: bool = False
-    makeup_reminder_hour: int = 11
+    makeup_reminder_hour: int = 17
     makeup_reminder_minute: int = 0
     makeup_deadline_hour: int = 12
     makeup_deadline_minute: int = 0
     makeup_summary_enabled: bool = False
-    makeup_summary_hour: int = 12
+    makeup_summary_hour: int = 22
     makeup_summary_minute: int = 0
     assignment_cycle_start_date: str = ""
     course_end_date: str = ""
@@ -248,10 +267,13 @@ class Settings:
         return ZoneInfo(self.timezone)
 
     def assignment_deadline(self, report_date: str) -> datetime:
-        cycle_start, due_day, _ = self.assignment_cycle(report_date)
+        cycle_start, cycle_end, _ = self.assignment_cycle(report_date)
         phase = self.course_phase(cycle_start)
         due_hour = phase.due_hour if phase else self.assignment_due_hour
         due_minute = phase.due_minute if phase else self.assignment_due_minute
+        due_day = cycle_end
+        if phase is not None and phase.due_day_offset is not None:
+            due_day = cycle_start + timedelta(days=phase.due_day_offset)
         raw = self.assignment_deadline_overrides.get(cycle_start.isoformat(), "").strip()
         if not raw:
             return datetime.combine(
@@ -269,16 +291,29 @@ class Settings:
 
     def makeup_deadline(self, report_date: str) -> datetime:
         normal_deadline = self.assignment_deadline(report_date)
+        cycle_start, _, _ = self.assignment_cycle(report_date)
+        phase = self.course_phase(cycle_start)
+        day_offset = phase.makeup_day_offset if phase else 1
+        hour = (
+            phase.makeup_hour
+            if phase is not None and phase.makeup_hour is not None
+            else self.makeup_deadline_hour
+        )
+        minute = (
+            phase.makeup_minute
+            if phase is not None and phase.makeup_minute is not None
+            else self.makeup_deadline_minute
+        )
         return datetime.combine(
-            normal_deadline.date() + timedelta(days=1),
-            time(self.makeup_deadline_hour, self.makeup_deadline_minute),
+            normal_deadline.date() + timedelta(days=day_offset),
+            time(hour, minute),
             tzinfo=self.tz,
         )
 
     def is_makeup_submission(self, report_date: str, submitted_at: datetime) -> bool:
         submitted_at = submitted_at.astimezone(self.tz)
-        return self.assignment_deadline(report_date) < submitted_at < self.makeup_deadline(
-            report_date
+        return (
+            self.assignment_deadline(report_date) < submitted_at < self.makeup_deadline(report_date)
         )
 
     @property
@@ -349,9 +384,7 @@ class Settings:
         return (phase.end_day - phase.start_day).days // phase.cycle_days + 1
 
     @staticmethod
-    def assignment_cycle_in_phase(
-        day: date, phase: CoursePhase
-    ) -> Tuple[date, date, int]:
+    def assignment_cycle_in_phase(day: date, phase: CoursePhase) -> Tuple[date, date, int]:
         effective_day = day
         if phase.end_day is not None and effective_day > phase.end_day:
             effective_day = phase.end_day
@@ -410,29 +443,62 @@ class Settings:
     def assignment_report_date(self, value: Union[str, date]) -> str:
         return self.assignment_cycle(value)[0].isoformat()
 
-    def is_assignment_due_day(self, value: Union[str, date]) -> bool:
+    def _report_date_for_deadline_day(
+        self,
+        value: Union[str, date],
+        *,
+        makeup: bool,
+    ) -> Optional[str]:
         day = value if isinstance(value, date) else datetime.strptime(value, "%Y-%m-%d").date()
-        if not self.course_is_active(day):
-            return False
-        return day == self.assignment_cycle(day)[1]
+        phases = self.configured_course_phases
+        if not phases:
+            candidates = [day - timedelta(days=offset) for offset in range(4)]
+        else:
+            candidates = []
+            for phase in reversed(phases):
+                if makeup and phase.end_day is not None and day > phase.end_day:
+                    continue
+                due_offset = (
+                    phase.due_day_offset
+                    if phase.due_day_offset is not None
+                    else phase.cycle_days - 1
+                )
+                lookback = phase.cycle_days + due_offset + phase.makeup_day_offset + 1
+                candidates.extend(
+                    candidate
+                    for offset in range(lookback + 1)
+                    if phase.contains(candidate := day - timedelta(days=offset))
+                )
+
+        seen: set[str] = set()
+        for candidate in candidates:
+            report_date = self.assignment_report_date(candidate)
+            if report_date in seen:
+                continue
+            seen.add(report_date)
+            deadline = (
+                self.makeup_deadline(report_date)
+                if makeup
+                else self.assignment_deadline(report_date)
+            )
+            if deadline.date() == day:
+                return report_date
+        return None
+
+    def assignment_due_report_date(self, value: Union[str, date]) -> Optional[str]:
+        return self._report_date_for_deadline_day(value, makeup=False)
+
+    def is_assignment_due_day(self, value: Union[str, date]) -> bool:
+        return self.assignment_due_report_date(value) is not None
 
     def is_makeup_day(self, value: Union[str, date]) -> bool:
-        day = value if isinstance(value, date) else datetime.strptime(value, "%Y-%m-%d").date()
-        previous_day = day - timedelta(days=1)
-        previous_phase = self.course_phase(previous_day)
-        if previous_phase is None:
-            return False
-        if previous_phase.end_day is not None and day > previous_phase.end_day:
-            return False
-        return day == self.assignment_cycle(previous_day)[1] + timedelta(days=1)
+        return self._report_date_for_deadline_day(value, makeup=True) is not None
 
     def makeup_report_date(self, value: Union[str, date]) -> str:
         day = value if isinstance(value, date) else datetime.strptime(value, "%Y-%m-%d").date()
-        previous_day = day - timedelta(days=1)
-        cycle_start, due_day, _ = self.assignment_cycle(previous_day)
-        if day == due_day + timedelta(days=1):
-            return cycle_start.isoformat()
-        return self.assignment_report_date(day)
+        return self._report_date_for_deadline_day(day, makeup=True) or self.assignment_report_date(
+            day
+        )
 
     def validate(self, require_secrets: bool = True) -> None:
         required = {
@@ -500,11 +566,13 @@ class Settings:
                 phase_start = phase.start_day
                 phase_end = phase.end_day
             except ValueError as exc:
-                raise ConfigurationError(
-                    f"第 {index} 个课程阶段的日期必须是 YYYY-MM-DD"
-                ) from exc
+                raise ConfigurationError(f"第 {index} 个课程阶段的日期必须是 YYYY-MM-DD") from exc
             if phase.cycle_days < 1:
                 raise ConfigurationError(f"第 {index} 个课程阶段的 cycle_days 必须大于等于 1")
+            if phase.due_day_offset is not None and phase.due_day_offset < 0:
+                raise ConfigurationError(f"第 {index} 个课程阶段的 due_day_offset 不能小于 0")
+            if phase.makeup_day_offset < 0:
+                raise ConfigurationError(f"第 {index} 个课程阶段的 makeup_day_offset 不能小于 0")
             if phase_end is not None and phase_end < phase_start:
                 raise ConfigurationError(f"第 {index} 个课程阶段的 end_date 不能早于 start_date")
             if previous_end is None and index > 1:
@@ -517,6 +585,12 @@ class Settings:
             ):
                 if not 0 <= hour <= 23 or not 0 <= minute <= 59:
                     raise ConfigurationError(f"第 {index} 个课程阶段的{label}时间不合法")
+            if phase.makeup_hour is not None and not 0 <= phase.makeup_hour <= 23:
+                raise ConfigurationError(f"第 {index} 个课程阶段的补交小时不合法")
+            if phase.makeup_minute is not None and not 0 <= phase.makeup_minute <= 59:
+                raise ConfigurationError(f"第 {index} 个课程阶段的补交分钟不合法")
+            if self.makeup_deadline(phase.start_date) <= self.assignment_deadline(phase.start_date):
+                raise ConfigurationError(f"第 {index} 个课程阶段的补交截止必须晚于正常截止")
             previous_end = phase_end
         if self.base_sync_enabled and (not self.base_token or not self.base_table_id):
             raise ConfigurationError("启用多维表格同步时必须配置 BASE_TOKEN 和 BASE_TABLE_ID")
@@ -594,13 +668,13 @@ def load_settings(env_file: str = ".env") -> Settings:
         final_status_enabled=_bool("FINAL_STATUS_ENABLED", False),
         final_status_hour=int(os.getenv("FINAL_STATUS_HOUR", "20")),
         final_status_minute=int(os.getenv("FINAL_STATUS_MINUTE", "0")),
-        makeup_reminder_enabled=_bool("MAKEUP_REMINDER_ENABLED", True),
-        makeup_reminder_hour=int(os.getenv("MAKEUP_REMINDER_HOUR", "11")),
+        makeup_reminder_enabled=_bool("MAKEUP_REMINDER_ENABLED", False),
+        makeup_reminder_hour=int(os.getenv("MAKEUP_REMINDER_HOUR", "17")),
         makeup_reminder_minute=int(os.getenv("MAKEUP_REMINDER_MINUTE", "0")),
         makeup_deadline_hour=int(os.getenv("MAKEUP_DEADLINE_HOUR", "12")),
         makeup_deadline_minute=int(os.getenv("MAKEUP_DEADLINE_MINUTE", "0")),
         makeup_summary_enabled=_bool("MAKEUP_SUMMARY_ENABLED", True),
-        makeup_summary_hour=int(os.getenv("MAKEUP_SUMMARY_HOUR", "12")),
+        makeup_summary_hour=int(os.getenv("MAKEUP_SUMMARY_HOUR", "22")),
         makeup_summary_minute=int(os.getenv("MAKEUP_SUMMARY_MINUTE", "0")),
         assignment_cycle_start_date=os.getenv("ASSIGNMENT_CYCLE_START_DATE", ""),
         course_end_date=os.getenv("COURSE_END_DATE", ""),

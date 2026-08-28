@@ -183,7 +183,7 @@ class FeishuApi:
                     "text": f"作业未交（{len(homework_missing)}人）：{'、'.join(homework_missing) or '无'}",
                 }
             ],
-            [{"tag": "text", "text": "请在今天 20:00 作业截止前完成打卡。"}],
+            [{"tag": "text", "text": "正常提交已截止，请在补交截止前完成打卡。"}],
         ]
         payload = self._json_request(
             "POST",
@@ -222,7 +222,7 @@ class FeishuApi:
                     "text": f"仍未补交（{len(homework_missing)}人）：{'、'.join(homework_missing) or '无'}",
                 }
             ],
-            [{"tag": "text", "text": "请在今天 20:00 补交截止前完成打卡。"}],
+            [{"tag": "text", "text": "请在本次补交截止前完成打卡。"}],
         ]
         payload = self._json_request(
             "POST",

@@ -25,11 +25,11 @@ def test_summary_commands_are_loaded_from_dotenv(tmp_path, monkeypatch):
     assert settings.reminder_hour == 17
     assert settings.missing_list_enabled is True
     assert settings.missing_list_hour == 20
-    assert settings.makeup_reminder_enabled is True
-    assert settings.makeup_reminder_hour == 11
+    assert settings.makeup_reminder_enabled is False
+    assert settings.makeup_reminder_hour == 17
     assert settings.makeup_deadline_hour == 12
     assert settings.makeup_summary_enabled is True
-    assert settings.makeup_summary_hour == 12
+    assert settings.makeup_summary_hour == 22
 
 
 def test_send_can_be_disabled_from_dotenv(tmp_path, monkeypatch):
@@ -233,7 +233,7 @@ def test_assignment_deadline_override_uses_summary_timezone(tmp_path, monkeypatc
     assert settings.assignment_deadline("2026-08-19").isoformat() == ("2026-08-19T20:00:00+08:00")
 
 
-def test_makeup_window_ends_strictly_before_next_day_noon(tmp_path, monkeypatch):
+def test_video_week_deadlines_are_next_day_noon_and_ten_pm(tmp_path, monkeypatch):
     env_file = tmp_path / ".env"
     env_file.write_text("", encoding="utf-8")
     for name in ("MAKEUP_DEADLINE_HOUR", "MAKEUP_DEADLINE_MINUTE"):
@@ -248,7 +248,10 @@ def test_makeup_window_ends_strictly_before_next_day_noon(tmp_path, monkeypatch)
                     "end_date": "",
                     "cycle_days": 1,
                     "publish_hour": 8,
-                    "due_hour": 20,
+                    "due_day_offset": 1,
+                    "due_hour": 12,
+                    "makeup_day_offset": 0,
+                    "makeup_hour": 22,
                 }
             ],
             ensure_ascii=False,
@@ -257,18 +260,11 @@ def test_makeup_window_ends_strictly_before_next_day_noon(tmp_path, monkeypatch)
     settings = load_settings(str(env_file))
     tz = ZoneInfo("Asia/Shanghai")
 
-    assert settings.makeup_deadline("2026-08-28").isoformat() == (
-        "2026-08-29T12:00:00+08:00"
-    )
-    assert settings.is_makeup_submission(
-        "2026-08-28", datetime(2026, 8, 28, 20, 0, 1, tzinfo=tz)
-    )
-    assert settings.is_makeup_submission(
-        "2026-08-28", datetime(2026, 8, 29, 11, 59, 59, tzinfo=tz)
-    )
-    assert not settings.is_makeup_submission(
-        "2026-08-28", datetime(2026, 8, 29, 12, 0, tzinfo=tz)
-    )
+    assert settings.assignment_deadline("2026-08-28").isoformat() == ("2026-08-29T12:00:00+08:00")
+    assert settings.makeup_deadline("2026-08-28").isoformat() == ("2026-08-29T22:00:00+08:00")
+    assert settings.is_makeup_submission("2026-08-28", datetime(2026, 8, 29, 12, 0, 1, tzinfo=tz))
+    assert settings.is_makeup_submission("2026-08-28", datetime(2026, 8, 29, 21, 59, 59, tzinfo=tz))
+    assert not settings.is_makeup_submission("2026-08-28", datetime(2026, 8, 29, 22, 0, tzinfo=tz))
 
 
 def test_group_databases_and_capture_only_chats_are_loaded(tmp_path, monkeypatch):
