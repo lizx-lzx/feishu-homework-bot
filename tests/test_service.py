@@ -2,12 +2,12 @@ import json
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Optional
 from zoneinfo import ZoneInfo
 
-from daily_report_bot.config import Settings
+from daily_report_bot.config import CoursePhase, Settings
 from daily_report_bot.models import AttendanceRecord, IncomingMessage, StoredMessage
 from daily_report_bot.router import GroupServiceRouter
 from daily_report_bot.service import GroupSummaryService
@@ -197,6 +197,29 @@ def make_settings(tmp_path: Path, *, send_enabled: bool = True) -> Settings:
         report_members=("小李", "小王"),
         report_link="https://example.com/base",
         review_tag="#复盘",
+    )
+
+
+def with_video_week(settings: Settings) -> Settings:
+    return replace(
+        settings,
+        course_phases=(
+            CoursePhase(
+                name="技术周",
+                start_date="2026-08-17",
+                end_date="2026-08-26",
+                cycle_days=2,
+                publish_hour=10,
+                due_hour=20,
+            ),
+            CoursePhase(
+                name="视频周",
+                start_date="2026-08-28",
+                cycle_days=1,
+                publish_hour=8,
+                due_hour=20,
+            ),
+        ),
     )
 
 
@@ -3008,3 +3031,112 @@ def test_group_router_applies_independent_profile_without_enabling_sends(tmp_pat
     assert service_24.settings.base_token == "bas_24"
     assert service_24.settings.assignment_deadline_overrides == {}
     assert "ou_manager" in service_24.settings.excluded_member_ids
+
+
+def test_video_week_is_an_independent_daily_course_phase(tmp_path):
+    settings = with_video_week(make_settings(tmp_path))
+
+    assert settings.assignment_cycle("2026-08-25") == (
+        date(2026, 8, 25),
+        date(2026, 8, 26),
+        5,
+    )
+    assert settings.course_is_active("2026-08-27") is False
+    assert settings.assignment_cycle("2026-08-28") == (
+        date(2026, 8, 28),
+        date(2026, 8, 28),
+        1,
+    )
+    assert settings.assignment_cycle("2026-08-29") == (
+        date(2026, 8, 29),
+        date(2026, 8, 29),
+        2,
+    )
+    assert settings.assignment_publish_clock("2026-08-28") == (8, 0)
+    assert settings.assignment_due_clock("2026-08-28") == (20, 0)
+    assert settings.is_assignment_due_day("2026-08-28") is True
+    assert settings.is_makeup_day("2026-08-28") is False
+    assert settings.is_makeup_day("2026-08-29") is True
+    assert settings.makeup_report_date("2026-08-29") == "2026-08-28"
+
+
+def test_assignment_number_uses_current_or_named_course_phase(tmp_path):
+    settings = with_video_week(make_settings(tmp_path))
+    service = GroupSummaryService(
+        settings,
+        FakeApi(),
+        FakeSummarizer(),
+        LocalStore(settings.db_path),
+    )
+    reference_day = date(2026, 8, 28)
+
+    assert service._query_report_date("第1次作业", reference_day) == "2026-08-28"
+    assert service._query_report_date("技术周第1次作业", reference_day) == "2026-08-17"
+    assert service._multi_cycle_assignment_numbers("技术周整体", reference_day) == [
+        1,
+        2,
+        3,
+        4,
+        5,
+    ]
+
+
+def test_video_week_submission_and_makeup_use_expected_reactions(tmp_path, monkeypatch):
+    original = with_video_week(make_settings(tmp_path))
+    settings = replace(
+        original,
+        homework_reaction_enabled=True,
+        course_phases=(
+            original.course_phases[0],
+            replace(original.course_phases[1], due_hour=12),
+        ),
+    )
+    api = FakeApi()
+    store = LocalStore(settings.db_path)
+    service = GroupSummaryService(settings, api, FakeSummarizer(), store)
+    monkeypatch.setattr("daily_report_bot.service.choice", lambda values: values[-1])
+
+    assert service.handle_message(
+        incoming(
+            "om_video_normal",
+            "#8月28日 第1次作业已完成\n作业说明：已完成视频练习",
+            created_at=datetime(2026, 8, 28, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+    ) is True
+    assert api.reactions[-1] == ("om_video_normal", "FINGERHEART")
+
+    assert service.handle_message(
+        incoming(
+            "om_video_makeup",
+            "#8月28日 第1次作业已补交\n作业说明：已补交视频练习",
+            sender_open_id="ou_2",
+            created_at=datetime(2026, 8, 28, 13, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+    ) is True
+    assert api.reactions[-1] == ("om_video_makeup", "Get")
+
+    attendance = {
+        record.sender_name: record
+        for record in store.list_daily_attendance("2026-08-28")
+    }
+    assert attendance["小李"].homework_status == "completed"
+    assert attendance["小王"].homework_status == "late"
+
+
+def test_gap_day_media_is_not_recorded_as_homework(tmp_path):
+    settings = with_video_week(make_settings(tmp_path))
+    api = FakeApi()
+    store = LocalStore(settings.db_path)
+    service = GroupSummaryService(settings, api, FakeSummarizer(), store)
+
+    service.handle_message(
+        incoming(
+            "om_gap_image",
+            "",
+            message_type="image",
+            created_at=datetime(2026, 8, 27, 12, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+    )
+
+    assert store.list_daily_attendance("2026-08-27") == []
+    assert service.send_due_summaries("2026-08-27") == []

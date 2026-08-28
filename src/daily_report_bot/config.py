@@ -103,6 +103,81 @@ def _load_excluded_member_ids() -> Tuple[str, ...]:
 
 
 @dataclass(frozen=True)
+class CoursePhase:
+    name: str
+    start_date: str
+    end_date: str = ""
+    cycle_days: int = 1
+    publish_hour: int = 20
+    publish_minute: int = 0
+    due_hour: int = 20
+    due_minute: int = 0
+
+    @property
+    def start_day(self) -> date:
+        return datetime.strptime(self.start_date, "%Y-%m-%d").date()
+
+    @property
+    def end_day(self) -> Optional[date]:
+        if not self.end_date:
+            return None
+        return datetime.strptime(self.end_date, "%Y-%m-%d").date()
+
+    def contains(self, day: date) -> bool:
+        return day >= self.start_day and (self.end_day is None or day <= self.end_day)
+
+
+def _load_course_phases() -> Tuple[CoursePhase, ...]:
+    raw = os.getenv("COURSE_PHASES_JSON", "").strip()
+    if not raw:
+        return ()
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ConfigurationError(f"COURSE_PHASES_JSON 不是合法 JSON：{exc}") from exc
+    if not isinstance(parsed, list):
+        raise ConfigurationError("COURSE_PHASES_JSON 必须是 JSON 数组")
+    phases = []
+    allowed = {
+        "name",
+        "start_date",
+        "end_date",
+        "cycle_days",
+        "publish_hour",
+        "publish_minute",
+        "due_hour",
+        "due_minute",
+    }
+    for index, item in enumerate(parsed, start=1):
+        if not isinstance(item, dict):
+            raise ConfigurationError(f"COURSE_PHASES_JSON 第 {index} 项必须是 JSON 对象")
+        unknown = set(item) - allowed
+        if unknown:
+            raise ConfigurationError(
+                f"COURSE_PHASES_JSON 第 {index} 项包含未知字段："
+                + ", ".join(sorted(unknown))
+            )
+        try:
+            phases.append(
+                CoursePhase(
+                    name=str(item.get("name") or "").strip(),
+                    start_date=str(item.get("start_date") or "").strip(),
+                    end_date=str(item.get("end_date") or "").strip(),
+                    cycle_days=int(item.get("cycle_days", 1)),
+                    publish_hour=int(item.get("publish_hour", 20)),
+                    publish_minute=int(item.get("publish_minute", 0)),
+                    due_hour=int(item.get("due_hour", 20)),
+                    due_minute=int(item.get("due_minute", 0)),
+                )
+            )
+        except (TypeError, ValueError) as exc:
+            raise ConfigurationError(
+                f"COURSE_PHASES_JSON 第 {index} 项的数字字段不合法"
+            ) from exc
+    return tuple(phases)
+
+
+@dataclass(frozen=True)
 class Settings:
     app_id: str
     app_secret: str
@@ -160,6 +235,7 @@ class Settings:
     assignment_publish_minute: int = 0
     assignment_due_hour: int = 20
     assignment_due_minute: int = 0
+    course_phases: Tuple[CoursePhase, ...] = ()
     assignment_deadline_overrides: Dict[str, str] = field(default_factory=dict)
     group_databases: Dict[str, str] = field(default_factory=dict)
     capture_only_chat_ids: Tuple[str, ...] = ()
@@ -171,11 +247,14 @@ class Settings:
 
     def assignment_deadline(self, report_date: str) -> datetime:
         cycle_start, due_day, _ = self.assignment_cycle(report_date)
+        phase = self.course_phase(cycle_start)
+        due_hour = phase.due_hour if phase else self.assignment_due_hour
+        due_minute = phase.due_minute if phase else self.assignment_due_minute
         raw = self.assignment_deadline_overrides.get(cycle_start.isoformat(), "").strip()
         if not raw:
             return datetime.combine(
                 due_day,
-                time(self.assignment_due_hour, self.assignment_due_minute),
+                time(due_hour, due_minute),
                 tzinfo=self.tz,
             )
         try:
@@ -188,50 +267,147 @@ class Settings:
 
     @property
     def course_end_day(self) -> Optional[date]:
-        if not self.course_end_date:
-            return None
-        return datetime.strptime(self.course_end_date, "%Y-%m-%d").date()
+        phase = self.course_phase_for_reference(datetime.now(tz=self.tz).date())
+        return phase.end_day if phase else None
+
+    @property
+    def configured_course_phases(self) -> Tuple[CoursePhase, ...]:
+        if self.course_phases:
+            return self.course_phases
+        if not self.assignment_cycle_start_date:
+            return ()
+        return (
+            CoursePhase(
+                name="技术周",
+                start_date=self.assignment_cycle_start_date,
+                end_date=self.course_end_date,
+                cycle_days=self.assignment_cycle_days,
+                publish_hour=self.assignment_publish_hour,
+                publish_minute=self.assignment_publish_minute,
+                due_hour=self.assignment_due_hour,
+                due_minute=self.assignment_due_minute,
+            ),
+        )
+
+    def course_phase(self, value: Union[str, date], name: str = "") -> Optional[CoursePhase]:
+        day = value if isinstance(value, date) else datetime.strptime(value, "%Y-%m-%d").date()
+        phases = self.configured_course_phases
+        if name:
+            return next((phase for phase in phases if phase.name == name), None)
+        return next((phase for phase in phases if phase.contains(day)), None)
+
+    def course_phase_for_reference(
+        self,
+        value: Union[str, date],
+        name: str = "",
+    ) -> Optional[CoursePhase]:
+        day = value if isinstance(value, date) else datetime.strptime(value, "%Y-%m-%d").date()
+        if name:
+            return self.course_phase(day, name)
+        if phase := self.course_phase(day):
+            return phase
+        previous = [phase for phase in self.configured_course_phases if phase.start_day <= day]
+        return previous[-1] if previous else None
+
+    def course_is_active(self, value: Union[str, date]) -> bool:
+        return self.course_phase(value) is not None
 
     def course_has_ended(self, value: Union[str, date]) -> bool:
         day = value if isinstance(value, date) else datetime.strptime(value, "%Y-%m-%d").date()
-        return self.course_end_day is not None and day > self.course_end_day
+        if self.course_phase(day) is not None:
+            return False
+        if any(phase.start_day > day for phase in self.configured_course_phases):
+            return False
+        phase = self.course_phase_for_reference(day)
+        return phase is not None and phase.end_day is not None and day > phase.end_day
 
-    def total_assignment_cycles(self) -> Optional[int]:
-        if not self.assignment_cycle_start_date or self.course_end_day is None:
+    def total_assignment_cycles(
+        self,
+        value: Optional[Union[str, date]] = None,
+        course_name: str = "",
+    ) -> Optional[int]:
+        reference = value or datetime.now(tz=self.tz).date()
+        phase = self.course_phase_for_reference(reference, course_name)
+        if phase is None or phase.end_day is None:
             return None
-        course_start = datetime.strptime(self.assignment_cycle_start_date, "%Y-%m-%d").date()
-        return (self.course_end_day - course_start).days // self.assignment_cycle_days + 1
+        return (phase.end_day - phase.start_day).days // phase.cycle_days + 1
+
+    @staticmethod
+    def assignment_cycle_in_phase(
+        day: date, phase: CoursePhase
+    ) -> Tuple[date, date, int]:
+        effective_day = day
+        if phase.end_day is not None and effective_day > phase.end_day:
+            effective_day = phase.end_day
+        index = max(0, (effective_day - phase.start_day).days // phase.cycle_days)
+        cycle_start = phase.start_day + timedelta(days=index * phase.cycle_days)
+        cycle_end = cycle_start + timedelta(days=phase.cycle_days - 1)
+        if phase.end_day is not None:
+            cycle_end = min(cycle_end, phase.end_day)
+        return cycle_start, cycle_end, index + 1
 
     def assignment_cycle(self, value: Union[str, date]) -> Tuple[date, date, int]:
         day = value if isinstance(value, date) else datetime.strptime(value, "%Y-%m-%d").date()
-        if not self.assignment_cycle_start_date or self.assignment_cycle_days <= 1:
+        phase = self.course_phase(day)
+        if phase is not None:
+            return self.assignment_cycle_in_phase(day, phase)
+        phases = self.configured_course_phases
+        if not phases:
             return day, day, 1
-        course_start = datetime.strptime(self.assignment_cycle_start_date, "%Y-%m-%d").date()
-        if self.course_end_day is not None and day > self.course_end_day:
-            day = self.course_end_day
-        if day < course_start:
+        if any(item.start_day > day for item in phases):
             return day, day, 1
-        index = (day - course_start).days // self.assignment_cycle_days
-        cycle_start = course_start + timedelta(days=index * self.assignment_cycle_days)
-        cycle_end = cycle_start + timedelta(days=self.assignment_cycle_days - 1)
-        if self.course_end_day is not None:
-            cycle_end = min(cycle_end, self.course_end_day)
-        return cycle_start, cycle_end, index + 1
+        previous = [item for item in phases if item.start_day <= day]
+        if previous and previous[-1].end_day is not None and day > previous[-1].end_day:
+            return self.assignment_cycle_in_phase(day, previous[-1])
+        return day, day, 1
+
+    def assignment_date_for_number(
+        self,
+        assignment_number: int,
+        reference_day: Union[str, date],
+        course_name: str = "",
+    ) -> Optional[date]:
+        phase = self.course_phase_for_reference(reference_day, course_name)
+        if phase is None or assignment_number < 1:
+            return None
+        target = phase.start_day + timedelta(days=(assignment_number - 1) * phase.cycle_days)
+        if phase.end_day is not None and target > phase.end_day:
+            return None
+        return target
+
+    def assignment_cycle_days_for(self, value: Union[str, date]) -> int:
+        phase = self.course_phase_for_reference(value)
+        return phase.cycle_days if phase else self.assignment_cycle_days
+
+    def assignment_publish_clock(self, value: Union[str, date]) -> Tuple[int, int]:
+        phase = self.course_phase_for_reference(value)
+        if phase:
+            return phase.publish_hour, phase.publish_minute
+        return self.assignment_publish_hour, self.assignment_publish_minute
+
+    def assignment_due_clock(self, value: Union[str, date]) -> Tuple[int, int]:
+        phase = self.course_phase_for_reference(value)
+        if phase:
+            return phase.due_hour, phase.due_minute
+        return self.assignment_due_hour, self.assignment_due_minute
 
     def assignment_report_date(self, value: Union[str, date]) -> str:
         return self.assignment_cycle(value)[0].isoformat()
 
     def is_assignment_due_day(self, value: Union[str, date]) -> bool:
         day = value if isinstance(value, date) else datetime.strptime(value, "%Y-%m-%d").date()
-        if self.course_has_ended(day):
+        if not self.course_is_active(day):
             return False
         return day == self.assignment_cycle(day)[1]
 
     def is_makeup_day(self, value: Union[str, date]) -> bool:
         day = value if isinstance(value, date) else datetime.strptime(value, "%Y-%m-%d").date()
-        if self.course_has_ended(day):
-            return False
         previous_day = day - timedelta(days=1)
+        previous_phase = self.course_phase(previous_day)
+        if previous_phase is None:
+            return False
+        if previous_phase.end_day is not None and day > previous_phase.end_day:
+            return False
         return day == self.assignment_cycle(previous_day)[1] + timedelta(days=1)
 
     def makeup_report_date(self, value: Union[str, date]) -> str:
@@ -299,6 +475,32 @@ class Settings:
                 )
             if course_end < course_start:
                 raise ConfigurationError("COURSE_END_DATE 不能早于 ASSIGNMENT_CYCLE_START_DATE")
+        previous_end: Optional[date] = None
+        for index, phase in enumerate(self.configured_course_phases, start=1):
+            if not phase.name or not phase.start_date:
+                raise ConfigurationError(f"第 {index} 个课程阶段必须配置 name 和 start_date")
+            try:
+                phase_start = phase.start_day
+                phase_end = phase.end_day
+            except ValueError as exc:
+                raise ConfigurationError(
+                    f"第 {index} 个课程阶段的日期必须是 YYYY-MM-DD"
+                ) from exc
+            if phase.cycle_days < 1:
+                raise ConfigurationError(f"第 {index} 个课程阶段的 cycle_days 必须大于等于 1")
+            if phase_end is not None and phase_end < phase_start:
+                raise ConfigurationError(f"第 {index} 个课程阶段的 end_date 不能早于 start_date")
+            if previous_end is None and index > 1:
+                raise ConfigurationError("无结束日的课程阶段必须放在最后")
+            if previous_end is not None and phase_start <= previous_end:
+                raise ConfigurationError("课程阶段的日期不能重叠")
+            for label, hour, minute in (
+                ("发布", phase.publish_hour, phase.publish_minute),
+                ("截止", phase.due_hour, phase.due_minute),
+            ):
+                if not 0 <= hour <= 23 or not 0 <= minute <= 59:
+                    raise ConfigurationError(f"第 {index} 个课程阶段的{label}时间不合法")
+            previous_end = phase_end
         if self.base_sync_enabled and (not self.base_token or not self.base_table_id):
             raise ConfigurationError("启用多维表格同步时必须配置 BASE_TOKEN 和 BASE_TABLE_ID")
         if self.max_messages < 1 or self.max_chars_per_request < 1000:
@@ -388,6 +590,7 @@ def load_settings(env_file: str = ".env") -> Settings:
         assignment_publish_minute=int(os.getenv("ASSIGNMENT_PUBLISH_MINUTE", "0")),
         assignment_due_hour=int(os.getenv("ASSIGNMENT_DUE_HOUR", "20")),
         assignment_due_minute=int(os.getenv("ASSIGNMENT_DUE_MINUTE", "0")),
+        course_phases=_load_course_phases(),
         assignment_deadline_overrides=_json_string_map("ASSIGNMENT_DEADLINE_OVERRIDES_JSON"),
         group_databases=_json_string_map("GROUP_DATABASES_JSON"),
         capture_only_chat_ids=_csv("CAPTURE_ONLY_CHAT_IDS"),

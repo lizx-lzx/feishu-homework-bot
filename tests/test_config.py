@@ -57,6 +57,72 @@ def test_course_end_date_is_loaded_from_dotenv(tmp_path, monkeypatch):
     assert settings.course_end_date == "2026-08-26"
 
 
+def test_multiple_course_phases_are_loaded_from_dotenv(tmp_path, monkeypatch):
+    phases = [
+        {
+            "name": "技术周",
+            "start_date": "2026-08-17",
+            "end_date": "2026-08-26",
+            "cycle_days": 2,
+            "publish_hour": 10,
+            "due_hour": 20,
+        },
+        {
+            "name": "视频周",
+            "start_date": "2026-08-28",
+            "end_date": "",
+            "cycle_days": 1,
+            "publish_hour": 8,
+            "due_hour": 20,
+        },
+    ]
+    env_file = tmp_path / ".env"
+    env_file.write_text("", encoding="utf-8")
+    monkeypatch.setenv("FEISHU_APP_ID", "cli_test")
+    monkeypatch.setenv("BASE_SYNC_ENABLED", "false")
+    monkeypatch.setenv("COURSE_PHASES_JSON", json.dumps(phases, ensure_ascii=False))
+
+    settings = load_settings(str(env_file))
+    settings.validate(require_secrets=False)
+
+    assert [phase.name for phase in settings.course_phases] == ["技术周", "视频周"]
+    assert settings.course_phases[0].cycle_days == 2
+    assert settings.course_phases[1].publish_hour == 8
+    assert settings.course_phases[1].end_day is None
+
+
+@pytest.mark.parametrize(
+    "phases, error",
+    [
+        (
+            [
+                {"name": "A", "start_date": "2026-08-17", "end_date": ""},
+                {"name": "B", "start_date": "2026-08-28", "end_date": ""},
+            ],
+            "无结束日的课程阶段必须放在最后",
+        ),
+        (
+            [
+                {"name": "A", "start_date": "2026-08-17", "end_date": "2026-08-26"},
+                {"name": "B", "start_date": "2026-08-26", "end_date": "2026-08-30"},
+            ],
+            "课程阶段的日期不能重叠",
+        ),
+    ],
+)
+def test_invalid_course_phases_are_rejected(tmp_path, monkeypatch, phases, error):
+    env_file = tmp_path / ".env"
+    env_file.write_text("", encoding="utf-8")
+    monkeypatch.setenv("FEISHU_APP_ID", "cli_test")
+    monkeypatch.setenv("BASE_SYNC_ENABLED", "false")
+    monkeypatch.setenv("COURSE_PHASES_JSON", json.dumps(phases, ensure_ascii=False))
+
+    settings = load_settings(str(env_file))
+
+    with pytest.raises(ConfigurationError, match=error):
+        settings.validate(require_secrets=False)
+
+
 def test_course_end_date_must_not_precede_course_start(tmp_path, monkeypatch):
     env_file = tmp_path / ".env"
     env_file.write_text(
