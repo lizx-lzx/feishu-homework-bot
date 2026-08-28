@@ -28,15 +28,16 @@ _COMPLETION_STATUS = (
     r"已完成补打卡|已完成补提交|已完成补交|已完成补卡|补交打卡|"
     r"已补打卡|补打卡|已补提交|补提交|已补交|补交|已补卡|补卡|已完成|完成"
 )
+_COMPLETION_STATUS_END = r"(?!情况|要求|格式|了吗|吗|么|不了|度|率)"
 _DATED_COMPLETION_MARKER = re.compile(
     rf"#\s*(?P<mmdd>\d{{4}})\s*日?\s*(?P<label>[^#\n]{{0,30}}?)"
     rf"(?P<status>{_COMPLETION_STATUS})"
-    r"(?=$|[\s，。！!]|https?://)"
+    rf"{_COMPLETION_STATUS_END}"
 )
 _NATURAL_DATED_COMPLETION_MARKER = re.compile(
     r"#\s*(?P<month>\d{1,2})\s*月\s*(?P<day>\d{1,2})\s*日?\s*"
     rf"(?P<label>[^#\n]{{0,30}}?)(?P<status>{_COMPLETION_STATUS})"
-    r"(?=$|[\s，。！!]|https?://)"
+    rf"{_COMPLETION_STATUS_END}"
 )
 _DAY_HOMEWORK_MARKER = re.compile(r"#\s*作业\s+(?P<assignment>DAY\s*\d+)", re.IGNORECASE)
 _LATE_MARKER = re.compile(r"(?:#\s*)?补(?:提交|交|卡|打卡)")
@@ -65,7 +66,8 @@ _RECENT_ASSIGNMENTS = re.compile(
 _TECH_WEEK_OVERVIEW = re.compile(r"技术周(?:整体|全部|总览|汇总|打卡情况|作业情况)?")
 _VIDEO_WEEK_OVERVIEW = re.compile(r"视频周(?:整体|全部|总览|汇总|打卡情况|作业情况)?")
 _ASSIGNMENT_LABEL_ONLY = re.compile(
-    r"^第\s*(?P<number>\d+|[一二三四五六七八九十]+)\s*(?:次\s*)?作业$"
+    r"^第\s*(?P<number>\d+|[一二三四五六七八九十]+)\s*(?:次\s*)?"
+    r"(?:视频|图片|文字|技术)?作业(?:视频|图片|文字|技术)?$"
 )
 _THREAD_COMPLETION_TEXT = re.compile(r"^\s*(?:#\s*)?已完成\s*[.!！。]?\s*$")
 _WEB_LINK = re.compile(r"https?://\S+", re.IGNORECASE)

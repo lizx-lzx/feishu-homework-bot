@@ -3123,6 +3123,65 @@ def test_video_week_submission_and_makeup_use_expected_reactions(tmp_path, monke
     assert attendance["小王"].homework_status == "late"
 
 
+def test_video_assignment_label_and_trailing_note_are_recognized(tmp_path):
+    original = with_video_week(make_settings(tmp_path))
+    settings = replace(
+        original,
+        report_members=("凡", "cove"),
+        member_aliases={"ou_1": "凡", "ou_2": "cove"},
+    )
+    store = LocalStore(settings.db_path)
+    service = GroupSummaryService(settings, FakeApi(), FakeSummarizer(), store)
+
+    service.handle_message(
+        incoming(
+            "om_video_first_version",
+            "#8月28日  第1次作业视频已完成上面的是第一版",
+            created_at=datetime(2026, 8, 28, 15, 54, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+    )
+    service.handle_message(
+        incoming(
+            "om_video_complete",
+            "#8月28日  第1次作业视频已完成",
+            sender_open_id="ou_2",
+            created_at=datetime(2026, 8, 28, 16, 8, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+    )
+
+    messages = service._named_messages("2026-08-28", "oc_group")
+    homework_messages = service._assignment_window_messages(
+        "2026-08-28",
+        "oc_group",
+        *settings.assignment_due_clock("2026-08-28"),
+    )
+    facts = service._completion_facts(
+        "2026-08-28",
+        messages,
+        homework_messages=homework_messages,
+    )
+
+    assert facts["assignment_label"] == "第1次作业"
+    assert facts["homework_members"] == ["凡", "cove"]
+    assert facts["homework_evidence"]["凡"] == ["om_video_first_version"]
+    assert facts["homework_evidence"]["cove"] == ["om_video_complete"]
+
+
+def test_completion_question_is_not_treated_as_submission(tmp_path):
+    settings = with_video_week(make_settings(tmp_path))
+    service = GroupSummaryService(
+        settings,
+        FakeApi(),
+        FakeSummarizer(),
+        LocalStore(settings.db_path),
+    )
+
+    assert service._submission_report_dates(
+        "#8月28日 第1次作业完成情况怎么样",
+        date(2026, 8, 28),
+    ) == []
+
+
 def test_gap_day_media_is_not_recorded_as_homework(tmp_path):
     settings = with_video_week(make_settings(tmp_path))
     api = FakeApi()
