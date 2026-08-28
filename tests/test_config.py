@@ -1,4 +1,7 @@
 import json
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
 import pytest
 
 from daily_report_bot.config import (
@@ -23,9 +26,10 @@ def test_summary_commands_are_loaded_from_dotenv(tmp_path, monkeypatch):
     assert settings.missing_list_enabled is True
     assert settings.missing_list_hour == 20
     assert settings.makeup_reminder_enabled is True
-    assert settings.makeup_reminder_hour == 17
+    assert settings.makeup_reminder_hour == 11
+    assert settings.makeup_deadline_hour == 12
     assert settings.makeup_summary_enabled is True
-    assert settings.makeup_summary_hour == 20
+    assert settings.makeup_summary_hour == 12
 
 
 def test_send_can_be_disabled_from_dotenv(tmp_path, monkeypatch):
@@ -227,6 +231,44 @@ def test_assignment_deadline_override_uses_summary_timezone(tmp_path, monkeypatc
 
     assert settings.assignment_deadline("2026-08-17").isoformat() == ("2026-08-18T14:00:00+08:00")
     assert settings.assignment_deadline("2026-08-19").isoformat() == ("2026-08-19T20:00:00+08:00")
+
+
+def test_makeup_window_ends_strictly_before_next_day_noon(tmp_path, monkeypatch):
+    env_file = tmp_path / ".env"
+    env_file.write_text("", encoding="utf-8")
+    for name in ("MAKEUP_DEADLINE_HOUR", "MAKEUP_DEADLINE_MINUTE"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv(
+        "COURSE_PHASES_JSON",
+        json.dumps(
+            [
+                {
+                    "name": "视频周",
+                    "start_date": "2026-08-28",
+                    "end_date": "",
+                    "cycle_days": 1,
+                    "publish_hour": 8,
+                    "due_hour": 20,
+                }
+            ],
+            ensure_ascii=False,
+        ),
+    )
+    settings = load_settings(str(env_file))
+    tz = ZoneInfo("Asia/Shanghai")
+
+    assert settings.makeup_deadline("2026-08-28").isoformat() == (
+        "2026-08-29T12:00:00+08:00"
+    )
+    assert settings.is_makeup_submission(
+        "2026-08-28", datetime(2026, 8, 28, 20, 0, 1, tzinfo=tz)
+    )
+    assert settings.is_makeup_submission(
+        "2026-08-28", datetime(2026, 8, 29, 11, 59, 59, tzinfo=tz)
+    )
+    assert not settings.is_makeup_submission(
+        "2026-08-28", datetime(2026, 8, 29, 12, 0, tzinfo=tz)
+    )
 
 
 def test_group_databases_and_capture_only_chats_are_loaded(tmp_path, monkeypatch):

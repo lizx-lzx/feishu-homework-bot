@@ -223,10 +223,12 @@ class Settings:
     final_status_hour: int = 20
     final_status_minute: int = 0
     makeup_reminder_enabled: bool = False
-    makeup_reminder_hour: int = 17
+    makeup_reminder_hour: int = 11
     makeup_reminder_minute: int = 0
+    makeup_deadline_hour: int = 12
+    makeup_deadline_minute: int = 0
     makeup_summary_enabled: bool = False
-    makeup_summary_hour: int = 20
+    makeup_summary_hour: int = 12
     makeup_summary_minute: int = 0
     assignment_cycle_start_date: str = ""
     course_end_date: str = ""
@@ -264,6 +266,20 @@ class Settings:
         if deadline.tzinfo is None:
             deadline = deadline.replace(tzinfo=self.tz)
         return deadline.astimezone(self.tz)
+
+    def makeup_deadline(self, report_date: str) -> datetime:
+        normal_deadline = self.assignment_deadline(report_date)
+        return datetime.combine(
+            normal_deadline.date() + timedelta(days=1),
+            time(self.makeup_deadline_hour, self.makeup_deadline_minute),
+            tzinfo=self.tz,
+        )
+
+    def is_makeup_submission(self, report_date: str, submitted_at: datetime) -> bool:
+        submitted_at = submitted_at.astimezone(self.tz)
+        return self.assignment_deadline(report_date) < submitted_at < self.makeup_deadline(
+            report_date
+        )
 
     @property
     def course_end_day(self) -> Optional[date]:
@@ -443,6 +459,7 @@ class Settings:
         for label, hour, minute in (
             ("最终汇总", self.final_status_hour, self.final_status_minute),
             ("补交提醒", self.makeup_reminder_hour, self.makeup_reminder_minute),
+            ("补交截止", self.makeup_deadline_hour, self.makeup_deadline_minute),
             ("补交汇总", self.makeup_summary_hour, self.makeup_summary_minute),
             ("作业发布", self.assignment_publish_hour, self.assignment_publish_minute),
             ("作业截止", self.assignment_due_hour, self.assignment_due_minute),
@@ -578,10 +595,12 @@ def load_settings(env_file: str = ".env") -> Settings:
         final_status_hour=int(os.getenv("FINAL_STATUS_HOUR", "20")),
         final_status_minute=int(os.getenv("FINAL_STATUS_MINUTE", "0")),
         makeup_reminder_enabled=_bool("MAKEUP_REMINDER_ENABLED", True),
-        makeup_reminder_hour=int(os.getenv("MAKEUP_REMINDER_HOUR", "17")),
+        makeup_reminder_hour=int(os.getenv("MAKEUP_REMINDER_HOUR", "11")),
         makeup_reminder_minute=int(os.getenv("MAKEUP_REMINDER_MINUTE", "0")),
+        makeup_deadline_hour=int(os.getenv("MAKEUP_DEADLINE_HOUR", "12")),
+        makeup_deadline_minute=int(os.getenv("MAKEUP_DEADLINE_MINUTE", "0")),
         makeup_summary_enabled=_bool("MAKEUP_SUMMARY_ENABLED", True),
-        makeup_summary_hour=int(os.getenv("MAKEUP_SUMMARY_HOUR", "20")),
+        makeup_summary_hour=int(os.getenv("MAKEUP_SUMMARY_HOUR", "12")),
         makeup_summary_minute=int(os.getenv("MAKEUP_SUMMARY_MINUTE", "0")),
         assignment_cycle_start_date=os.getenv("ASSIGNMENT_CYCLE_START_DATE", ""),
         course_end_date=os.getenv("COURSE_END_DATE", ""),

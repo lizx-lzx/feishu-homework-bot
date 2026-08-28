@@ -1496,12 +1496,11 @@ class GroupSummaryService:
             time(publish_hour, publish_minute),
             tzinfo=self.settings.tz,
         )
-        deadline = self.settings.assignment_deadline(report_date)
-        makeup_end = deadline + timedelta(hours=24)
+        makeup_end = self.settings.makeup_deadline(report_date)
         candidates = self.store.list_messages(
             claim_message.chat_id,
             int(start.timestamp() * 1000),
-            int(makeup_end.timestamp() * 1000) + 1,
+            int(makeup_end.timestamp() * 1000),
             self.settings.max_messages,
         )
         candidates = [
@@ -1953,8 +1952,12 @@ class GroupSummaryService:
         if not messages:
             return
         start_ms = int(self.settings.assignment_deadline(report_date).timestamp() * 1000) + 1
-        late_stage_end = self.settings.assignment_deadline(report_date) + timedelta(hours=24)
-        end_ms = int(min(datetime.now(tz=self.settings.tz), late_stage_end).timestamp() * 1000) + 1
+        late_stage_end = self.settings.makeup_deadline(report_date)
+        now = datetime.now(tz=self.settings.tz)
+        end_ms = min(
+            int(now.timestamp() * 1000) + 1,
+            int(late_stage_end.timestamp() * 1000),
+        )
         if start_ms >= end_ms:
             return
         later_messages = self.store.list_messages(

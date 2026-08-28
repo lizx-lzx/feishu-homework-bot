@@ -363,7 +363,7 @@ def test_homework_reaction_uses_cycle_stage_pools_and_is_idempotent(tmp_path, mo
     makeup = incoming(
         "om_makeup_reaction",
         "#8月21日 第2次作业已补交\n技术作业\n作业说明：已完成网页部署",
-        created_at=datetime(2026, 8, 21, 12, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        created_at=datetime(2026, 8, 21, 11, 59, tzinfo=ZoneInfo("Asia/Shanghai")),
     )
 
     assert service.handle_message(day_one) is True
@@ -1363,7 +1363,7 @@ def test_makeup_submission_spelling_is_recognized_as_late(tmp_path):
             "om_makeup_submission_spelling",
             "#0822 第3次作业补提交\n技术作业\n成果链接：https://example.com/work",
             sender_open_id="ou_2",
-            created_at=datetime(2026, 8, 23, 19, 52, tzinfo=ZoneInfo("Asia/Shanghai")),
+            created_at=datetime(2026, 8, 23, 11, 52, tzinfo=ZoneInfo("Asia/Shanghai")),
         )
     )
 
@@ -2531,7 +2531,7 @@ def test_makeup_notifications_run_on_third_day_and_split_final_status(tmp_path):
     assert attendance["小周"].homework_status == "missing"
 
 
-def test_makeup_day_tags_use_assignment_number_and_accept_real_group_formats(tmp_path):
+def test_makeup_day_tags_only_count_before_noon_cutoff(tmp_path):
     original = make_settings(tmp_path)
     settings = replace(
         original,
@@ -2567,7 +2567,7 @@ def test_makeup_day_tags_use_assignment_number_and_accept_real_group_formats(tmp
             "om_tang",
             "#0821日 第2次作业补交打卡\n作业说明：已完成补卡作业",
             "ou_3",
-            datetime(2026, 8, 21, 18, 10, tzinfo=ZoneInfo("Asia/Shanghai")),
+            datetime(2026, 8, 21, 12, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
         ),
         (
             "om_zeng",
@@ -2602,11 +2602,11 @@ def test_makeup_day_tags_use_assignment_number_and_accept_real_group_formats(tmp
     }
     assert attendance["正常成员"].homework_status == "completed"
     assert attendance["成员乙"].homework_status == "late"
-    assert attendance["成员丙"].homework_status == "late"
-    assert attendance["成员丁"].homework_status == "late"
+    assert attendance["成员丙"].homework_status == "missing"
+    assert attendance["成员丁"].homework_status == "missing"
     assert attendance["成员乙"].homework_message_ids == ("om_pigeon",)
-    assert attendance["成员丙"].homework_message_ids == ("om_tang",)
-    assert attendance["成员丁"].homework_message_ids == ("om_zeng",)
+    assert attendance["成员丙"].homework_message_ids == ()
+    assert attendance["成员丁"].homework_message_ids == ()
 
 
 def test_self_makeup_claim_without_evidence_does_not_change_status(tmp_path):

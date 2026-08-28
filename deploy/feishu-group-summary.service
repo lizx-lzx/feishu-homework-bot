@@ -30,10 +30,12 @@ Environment=FINAL_STATUS_ENABLED=true
 Environment=FINAL_STATUS_HOUR=20
 Environment=FINAL_STATUS_MINUTE=0
 Environment=MAKEUP_REMINDER_ENABLED=true
-Environment=MAKEUP_REMINDER_HOUR=17
+Environment=MAKEUP_REMINDER_HOUR=11
 Environment=MAKEUP_REMINDER_MINUTE=0
+Environment=MAKEUP_DEADLINE_HOUR=12
+Environment=MAKEUP_DEADLINE_MINUTE=0
 Environment=MAKEUP_SUMMARY_ENABLED=true
-Environment=MAKEUP_SUMMARY_HOUR=20
+Environment=MAKEUP_SUMMARY_HOUR=12
 Environment=MAKEUP_SUMMARY_MINUTE=0
 Environment='COURSE_PHASES_JSON=[{"name":"技术周","start_date":"2026-08-17","end_date":"2026-08-26","cycle_days":2,"publish_hour":10,"publish_minute":0,"due_hour":20,"due_minute":0},{"name":"视频周","start_date":"2026-08-28","end_date":"","cycle_days":1,"publish_hour":8,"publish_minute":0,"due_hour":20,"due_minute":0}]'
 Environment=ASSIGNMENT_CYCLE_START_DATE=2026-08-17
