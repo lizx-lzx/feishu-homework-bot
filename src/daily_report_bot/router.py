@@ -29,6 +29,7 @@ def _apply_group_profile(settings: Settings, profile: Dict[str, Any]) -> Setting
         "missing_list_enabled",
         "makeup_reminder_enabled",
         "makeup_summary_enabled",
+        "course_end_date",
     }
     for key in scalar_fields:
         if key in profile:

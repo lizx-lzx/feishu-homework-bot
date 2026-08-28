@@ -5,7 +5,7 @@ import os
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
-from typing import Any, Dict, Tuple, Union
+from typing import Any, Dict, Optional, Tuple, Union
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
@@ -154,6 +154,7 @@ class Settings:
     makeup_summary_hour: int = 20
     makeup_summary_minute: int = 0
     assignment_cycle_start_date: str = ""
+    course_end_date: str = ""
     assignment_cycle_days: int = 1
     assignment_publish_hour: int = 20
     assignment_publish_minute: int = 0
@@ -185,16 +186,36 @@ class Settings:
             deadline = deadline.replace(tzinfo=self.tz)
         return deadline.astimezone(self.tz)
 
+    @property
+    def course_end_day(self) -> Optional[date]:
+        if not self.course_end_date:
+            return None
+        return datetime.strptime(self.course_end_date, "%Y-%m-%d").date()
+
+    def course_has_ended(self, value: Union[str, date]) -> bool:
+        day = value if isinstance(value, date) else datetime.strptime(value, "%Y-%m-%d").date()
+        return self.course_end_day is not None and day > self.course_end_day
+
+    def total_assignment_cycles(self) -> Optional[int]:
+        if not self.assignment_cycle_start_date or self.course_end_day is None:
+            return None
+        course_start = datetime.strptime(self.assignment_cycle_start_date, "%Y-%m-%d").date()
+        return (self.course_end_day - course_start).days // self.assignment_cycle_days + 1
+
     def assignment_cycle(self, value: Union[str, date]) -> Tuple[date, date, int]:
         day = value if isinstance(value, date) else datetime.strptime(value, "%Y-%m-%d").date()
         if not self.assignment_cycle_start_date or self.assignment_cycle_days <= 1:
             return day, day, 1
         course_start = datetime.strptime(self.assignment_cycle_start_date, "%Y-%m-%d").date()
+        if self.course_end_day is not None and day > self.course_end_day:
+            day = self.course_end_day
         if day < course_start:
             return day, day, 1
         index = (day - course_start).days // self.assignment_cycle_days
         cycle_start = course_start + timedelta(days=index * self.assignment_cycle_days)
         cycle_end = cycle_start + timedelta(days=self.assignment_cycle_days - 1)
+        if self.course_end_day is not None:
+            cycle_end = min(cycle_end, self.course_end_day)
         return cycle_start, cycle_end, index + 1
 
     def assignment_report_date(self, value: Union[str, date]) -> str:
@@ -202,10 +223,14 @@ class Settings:
 
     def is_assignment_due_day(self, value: Union[str, date]) -> bool:
         day = value if isinstance(value, date) else datetime.strptime(value, "%Y-%m-%d").date()
+        if self.course_has_ended(day):
+            return False
         return day == self.assignment_cycle(day)[1]
 
     def is_makeup_day(self, value: Union[str, date]) -> bool:
         day = value if isinstance(value, date) else datetime.strptime(value, "%Y-%m-%d").date()
+        if self.course_has_ended(day):
+            return False
         previous_day = day - timedelta(days=1)
         return day == self.assignment_cycle(previous_day)[1] + timedelta(days=1)
 
@@ -256,9 +281,24 @@ class Settings:
             raise ConfigurationError("SOCIAL_CHAT_HOURLY_LIMIT 必须大于等于 1")
         if self.assignment_cycle_start_date:
             try:
-                datetime.strptime(self.assignment_cycle_start_date, "%Y-%m-%d")
+                course_start = datetime.strptime(
+                    self.assignment_cycle_start_date, "%Y-%m-%d"
+                ).date()
             except ValueError as exc:
                 raise ConfigurationError("ASSIGNMENT_CYCLE_START_DATE 必须是 YYYY-MM-DD") from exc
+        else:
+            course_start = None
+        if self.course_end_date:
+            try:
+                course_end = datetime.strptime(self.course_end_date, "%Y-%m-%d").date()
+            except ValueError as exc:
+                raise ConfigurationError("COURSE_END_DATE 必须是 YYYY-MM-DD") from exc
+            if course_start is None:
+                raise ConfigurationError(
+                    "配置 COURSE_END_DATE 时必须同时配置 ASSIGNMENT_CYCLE_START_DATE"
+                )
+            if course_end < course_start:
+                raise ConfigurationError("COURSE_END_DATE 不能早于 ASSIGNMENT_CYCLE_START_DATE")
         if self.base_sync_enabled and (not self.base_token or not self.base_table_id):
             raise ConfigurationError("启用多维表格同步时必须配置 BASE_TOKEN 和 BASE_TABLE_ID")
         if self.max_messages < 1 or self.max_chars_per_request < 1000:
@@ -342,6 +382,7 @@ def load_settings(env_file: str = ".env") -> Settings:
         makeup_summary_hour=int(os.getenv("MAKEUP_SUMMARY_HOUR", "20")),
         makeup_summary_minute=int(os.getenv("MAKEUP_SUMMARY_MINUTE", "0")),
         assignment_cycle_start_date=os.getenv("ASSIGNMENT_CYCLE_START_DATE", ""),
+        course_end_date=os.getenv("COURSE_END_DATE", ""),
         assignment_cycle_days=int(os.getenv("ASSIGNMENT_CYCLE_DAYS", "1")),
         assignment_publish_hour=int(os.getenv("ASSIGNMENT_PUBLISH_HOUR", "20")),
         assignment_publish_minute=int(os.getenv("ASSIGNMENT_PUBLISH_MINUTE", "0")),

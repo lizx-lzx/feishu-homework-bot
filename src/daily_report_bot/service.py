@@ -299,6 +299,19 @@ class GroupSummaryService:
                 return reference_day.isoformat()
         return reference_day.isoformat()
 
+    def _course_assignment_limit_notice(self, text: str) -> Optional[str]:
+        match = _ASSIGNMENT_NUMBER.search(text)
+        total = self.settings.total_assignment_cycles()
+        if match is None or total is None:
+            return None
+        assignment_number = self._parse_assignment_number(match.group("number"))
+        if 1 <= assignment_number <= total:
+            return None
+        return (
+            f"本轮技术周已于{self.settings.course_end_date}结束，"
+            f"共{total}次作业，不存在第{assignment_number}次作业。"
+        )
+
     def _multi_cycle_assignment_numbers(
         self,
         question: str,
@@ -307,11 +320,16 @@ class GroupSummaryService:
         """把明确的多周期问法转成作业序号。
 
         “前 N 次”指从课程开始的前 N 期；“这 N 次”和“技术周”
-        只取当前周期之前的已结束周期，避免把正在提交的作业混进复查。
+        课程进行中只取当前周期之前的已结束周期，课程结束后则包含最后一期。
         """
         if not self.settings.assignment_cycle_start_date:
             return None
         _, _, current_assignment = self.settings.assignment_cycle(reference_day)
+        last_completed = (
+            current_assignment
+            if self.settings.course_has_ended(reference_day)
+            else current_assignment - 1
+        )
 
         match = _ASSIGNMENT_RANGE.search(question)
         if match:
@@ -324,7 +342,6 @@ class GroupSummaryService:
         match = _FIRST_ASSIGNMENTS.search(question)
         if match:
             count = self._parse_assignment_number(match.group("count"))
-            last_completed = current_assignment - 1
             if count < 1 or count > 12 or last_completed < 1:
                 return []
             return list(range(1, min(count, last_completed) + 1))
@@ -332,16 +349,15 @@ class GroupSummaryService:
         match = _RECENT_ASSIGNMENTS.search(question)
         if match:
             count = self._parse_assignment_number(match.group("count"))
-            last_completed = current_assignment - 1
             if count < 1 or count > 12 or last_completed < 1:
                 return []
             start = max(1, last_completed - count + 1)
             return list(range(start, last_completed + 1))
 
         if _TECH_WEEK_OVERVIEW.search(question) and not _ASSIGNMENT_NUMBER.search(question):
-            if current_assignment <= 1:
+            if last_completed < 1:
                 return []
-            return list(range(1, current_assignment))
+            return list(range(1, last_completed + 1))
         return None
 
     def _multi_cycle_base_statuses(
@@ -417,6 +433,14 @@ class GroupSummaryService:
             f"📊 第{assignment_numbers[0]}—{assignment_numbers[-1]}次作业复查（只读）",
             "",
         ]
+        if self.settings.course_has_ended(reference_day):
+            lines.extend(
+                [
+                    f"技术周已于{self.settings.course_end_date}结束，"
+                    f"本轮共{self.settings.total_assignment_cycles()}次作业。",
+                    "",
+                ]
+            )
         available_cycles = 0
         for assignment_number, report_date in zip(assignment_numbers, report_dates):
             records = self.store.list_daily_attendance(report_date)
@@ -782,9 +806,8 @@ class GroupSummaryService:
         lines.append("名单根据群内已识别的提交和打卡表状态生成；请假或误判可由组长在表里修正。")
         return "\n".join(lines)
 
-    @staticmethod
-    def _answer_menu() -> str:
-        return (
+    def _answer_menu(self) -> str:
+        menu = (
             "🎮 作业助教菜单\n\n"
             "@ 我后发送数字即可：\n"
             "1  本次作业进度\n"
@@ -796,6 +819,14 @@ class GroupSummaryService:
             "7  前三次作业复查\n\n"
             "也可直接说：“第三次还有谁掉队了”。\n"
             "交作业时加 #求反馈，我会根据文字给三行点评。"
+        )
+        if self.settings.course_end_day is None:
+            return menu
+        total = self.settings.total_assignment_cycles()
+        return (
+            f"{menu}\n\n"
+            f"技术周：{self.settings.assignment_cycle_start_date}—"
+            f"{self.settings.course_end_date}（已结束，共{total}次作业）。"
         )
 
     def _answer_my_stats(self, message: StoredMessage, reference_day: date) -> str:
@@ -1155,6 +1186,8 @@ class GroupSummaryService:
             return "只有本群已配置的组长可以代替其他成员修改作业状态。"
         if not self.settings.base_sync_enabled:
             return "本群尚未启用多维表格同步，暂时不能修改作业状态。"
+        if notice := self._course_assignment_limit_notice(question):
+            return notice
 
         requested_day = self._query_report_date(question, reference_day)
         report_date = self.settings.assignment_report_date(requested_day)
@@ -1233,11 +1266,15 @@ class GroupSummaryService:
     ) -> Optional[str]:
         if not _STATS_TOPIC.search(question):
             return None
+        if notice := self._course_assignment_limit_notice(question):
+            return notice
         if "迭代" in question:
             return self._answer_iteration_question(question)
         if _MEMBER_HISTORY_INTENT.search(question):
             return self._answer_member_history(question, reference_day)
         requested_date = self._query_report_date(question, reference_day)
+        if self.settings.course_has_ended(requested_date):
+            requested_date = self.settings.course_end_date
         report_date = self.settings.assignment_report_date(requested_date)
         messages = self._named_messages(requested_date, chat_id)
         homework_messages = self._assignment_window_messages(
@@ -1256,6 +1293,10 @@ class GroupSummaryService:
         roster = facts["roster"]
         total = len(roster)
         day_label = self._assignment_period_label(report_date)
+        if self.settings.course_has_ended(reference_day):
+            day_label = (
+                f"技术周已于{self.settings.course_end_date}结束；以下为历史记录。\n{day_label}"
+            )
         wants_review = "复盘" in question
         wants_homework = bool(re.search(r"作业|打卡|提交|没交|未交", question))
         if wants_review and not wants_homework:
@@ -1436,6 +1477,8 @@ class GroupSummaryService:
     ) -> str:
         if message.sender_name not in self.settings.report_members:
             return "你不在本群的打卡名单中，无法登记作业状态。"
+        if notice := self._course_assignment_limit_notice(question):
+            return notice
         report_date = self._self_makeup_report_date(question, reference_day)
         if report_date is None:
             return "请说明是第几次作业，例如：@知识库助手 补交第2次作业。"
@@ -1666,6 +1709,17 @@ class GroupSummaryService:
             text, reference_day
         ):
             if not self._is_submission_marker(text, position):
+                continue
+            assignment_match = _ASSIGNMENT_NUMBER.search(label)
+            if assignment_match:
+                assignment_number = self._parse_assignment_number(assignment_match.group("number"))
+                total = self.settings.total_assignment_cycles()
+                if total is not None and not 1 <= assignment_number <= total:
+                    continue
+            elif (
+                self.settings.course_end_day is not None
+                and candidate > self.settings.course_end_day
+            ):
                 continue
             report_dates.add(self._marker_report_date(candidate, label))
         return sorted(report_dates)
@@ -2296,6 +2350,8 @@ class GroupSummaryService:
     ) -> bool:
         if not self.settings.send_enabled or not self.settings.homework_reaction_enabled:
             return False
+        if self.settings.course_has_ended(submitted_at.date()):
+            return False
         if self.store.homework_reaction_sent(message.message_id):
             return False
         for raw_report_date in report_dates:
@@ -2558,7 +2614,25 @@ class GroupSummaryService:
             if not self.settings.send_enabled:
                 logger.info("发送已关闭，忽略群内总结指令：%s", message.message_id)
                 return False
+            if notice := self._course_assignment_limit_notice(command_text):
+                self.api.reply_text(
+                    message.message_id,
+                    notice,
+                    f"summary-course-limit-{message.message_id}",
+                )
+                return True
             requested_report_date = self._query_report_date(command_text, submitted_at.date())
+            if self.settings.course_has_ended(requested_report_date):
+                self.api.reply_text(
+                    message.message_id,
+                    (
+                        f"本轮技术周已于{self.settings.course_end_date}结束，"
+                        "结束日之后不再生成每日日报。"
+                        "可以问我“技术周整体”或“第5次作业情况”。"
+                    ),
+                    f"summary-course-ended-{message.message_id}",
+                )
+                return True
             result = self.build_summary(requested_report_date, message.chat_id)
             if result is None:
                 reply = f"{requested_report_date} 还没有收到可总结的群消息。"
@@ -2589,10 +2663,14 @@ class GroupSummaryService:
         report_dates: List[str] = []
         if inserted:
             report_dates = self._submission_report_dates(text, submitted_at.date())
-            if not report_dates and (
-                stored.message_type in _THREAD_HOMEWORK_TYPES
-                or "[图片]" in stored.content
-                or self._is_thread_homework(stored)
+            if (
+                not report_dates
+                and (
+                    stored.message_type in _THREAD_HOMEWORK_TYPES
+                    or "[图片]" in stored.content
+                    or self._is_thread_homework(stored)
+                )
+                and not self.settings.course_has_ended(submitted_at.date())
             ):
                 report_dates = [self.settings.assignment_report_date(submitted_at.date())]
             for report_date in report_dates:
@@ -2814,6 +2892,9 @@ class GroupSummaryService:
         return lines
 
     def build_summary(self, report_date: str, chat_id: str) -> Optional[SummaryResult]:
+        if self.settings.course_has_ended(report_date):
+            logger.info("技术周已结束，不再生成结束日后的日报：%s", report_date)
+            return None
         messages = self._named_messages(report_date, chat_id)
         if not messages:
             return None
@@ -2942,6 +3023,9 @@ class GroupSummaryService:
             logger.info("发送已关闭，跳过定时总结")
             return []
         day = report_date or self._scheduled_report_date()
+        if self.settings.course_has_ended(day):
+            logger.info("技术周已结束，跳过定时简报：%s", day)
+            return []
         chat_ids = sorted(set(self.settings.chat_ids) | set(self.store.list_chats()))
         if not chat_ids:
             logger.warning("还没有已知群聊；把机器人加入群并发一条消息后会自动记住")

@@ -42,6 +42,44 @@ def test_homework_reaction_can_be_enabled_from_dotenv(tmp_path, monkeypatch):
     assert load_settings(str(env_file)).homework_reaction_enabled is True
 
 
+def test_course_end_date_is_loaded_from_dotenv(tmp_path, monkeypatch):
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "ASSIGNMENT_CYCLE_START_DATE=2026-08-17\nCOURSE_END_DATE=2026-08-26\n",
+        encoding="utf-8",
+    )
+    for name in ("ASSIGNMENT_CYCLE_START_DATE", "COURSE_END_DATE"):
+        monkeypatch.delenv(name, raising=False)
+
+    settings = load_settings(str(env_file))
+
+    assert settings.assignment_cycle_start_date == "2026-08-17"
+    assert settings.course_end_date == "2026-08-26"
+
+
+def test_course_end_date_must_not_precede_course_start(tmp_path, monkeypatch):
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "FEISHU_APP_ID=cli_test\n"
+        "BASE_SYNC_ENABLED=false\n"
+        "ASSIGNMENT_CYCLE_START_DATE=2026-08-17\n"
+        "COURSE_END_DATE=2026-08-16\n",
+        encoding="utf-8",
+    )
+    for name in (
+        "FEISHU_APP_ID",
+        "BASE_SYNC_ENABLED",
+        "ASSIGNMENT_CYCLE_START_DATE",
+        "COURSE_END_DATE",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    settings = load_settings(str(env_file))
+
+    with pytest.raises(ConfigurationError, match="COURSE_END_DATE 不能早于"):
+        settings.validate(require_secrets=False)
+
+
 def test_minimax_is_the_default_summary_provider(tmp_path, monkeypatch):
     env_file = tmp_path / ".env"
     env_file.write_text("", encoding="utf-8")

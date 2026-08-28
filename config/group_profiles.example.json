@@ -13,6 +13,7 @@
     "leader_member_ids": ["ou_group_leader"],
     "send_enabled": true,
     "homework_reaction_enabled": true,
+    "course_end_date": "2026-08-26",
     "base_sync_enabled": true,
     "base_token": "your_base_token",
     "base_table_id": "your_table_id",

@@ -2229,6 +2229,121 @@ def test_two_day_assignment_cycle_uses_second_day_deadline(tmp_path):
     assert settings.assignment_deadline("2026-08-17").isoformat() == ("2026-08-18T20:00:00+08:00")
 
 
+def test_course_end_clamps_the_last_cycle_and_stops_future_schedules(tmp_path):
+    original = make_settings(tmp_path)
+    settings = replace(
+        original,
+        assignment_cycle_start_date="2026-08-17",
+        course_end_date="2026-08-26",
+        assignment_cycle_days=2,
+    )
+    api = FakeApi()
+    service = GroupSummaryService(
+        settings,
+        api,
+        FakeSummarizer(),
+        LocalStore(settings.db_path),
+    )
+
+    assert settings.assignment_cycle("2026-08-28") == (
+        datetime(2026, 8, 25).date(),
+        datetime(2026, 8, 26).date(),
+        5,
+    )
+    assert settings.total_assignment_cycles() == 5
+    assert settings.is_assignment_due_day("2026-08-28") is False
+    assert settings.is_makeup_day("2026-08-27") is False
+    assert service.send_due_summaries("2026-08-28") == []
+    assert api.sent == []
+
+
+def test_course_end_keeps_explicit_final_submission_but_ignores_untagged_media(tmp_path):
+    original = make_settings(tmp_path)
+    settings = replace(
+        original,
+        assignment_cycle_start_date="2026-08-17",
+        course_end_date="2026-08-26",
+        assignment_cycle_days=2,
+        assignment_publish_hour=10,
+        assignment_due_hour=20,
+        homework_reaction_enabled=True,
+    )
+    api = FakeApi()
+    store = LocalStore(settings.db_path)
+    service = GroupSummaryService(settings, api, FakeSummarizer(), store)
+    after_end = datetime(2026, 8, 27, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    service.handle_message(
+        incoming("om_untagged_after_end", "", message_type="image", created_at=after_end)
+    )
+    assert store.list_daily_attendance("2026-08-27") == []
+    assert store.list_daily_attendance("2026-08-25") == []
+
+    service.handle_message(
+        incoming(
+            "om_invalid_sixth",
+            "#8月27日 第6次作业已补交\n"
+            "成果链接：https://example.com/sixth\n作业说明：这不应该生成新周期",
+            created_at=after_end,
+        )
+    )
+    assert store.list_daily_attendance("2026-08-27") == []
+    assert store.list_daily_attendance("2026-08-25") == []
+
+    service.handle_message(
+        incoming(
+            "om_explicit_final",
+            "#8月25日 第5次作业已补交\n"
+            "成果链接：https://example.com/final\n作业说明：已完成项目并部署",
+            created_at=after_end,
+        )
+    )
+
+    attendance = {
+        record.sender_name: record for record in store.list_daily_attendance("2026-08-25")
+    }
+    assert attendance["小李"].homework_status == "late"
+    assert api.reactions == []
+
+
+def test_finished_course_menu_and_overview_include_all_five_assignments(tmp_path):
+    original = make_settings(tmp_path)
+    settings = replace(
+        original,
+        assignment_cycle_start_date="2026-08-17",
+        course_end_date="2026-08-26",
+        assignment_cycle_days=2,
+    )
+    api = FakeApi()
+    service = GroupSummaryService(
+        settings,
+        api,
+        FakeSummarizer(),
+        LocalStore(settings.db_path),
+    )
+    reference_day = datetime(2026, 8, 28).date()
+
+    assert service._multi_cycle_assignment_numbers("技术周整体情况", reference_day) == [
+        1,
+        2,
+        3,
+        4,
+        5,
+    ]
+    assert "2026-08-17—2026-08-26（已结束，共5次作业）" in service._answer_menu()
+    assert service._answer_stats_question("第6次谁没交作业", reference_day, "oc_group") == (
+        "本轮技术周已于2026-08-26结束，共5次作业，不存在第6次作业。"
+    )
+    service.handle_message(
+        incoming(
+            "om_report_after_end",
+            "打开日报",
+            created_at=datetime(2026, 8, 28, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+    )
+    assert "结束日之后不再生成每日日报" in api.replies[-1][1]
+
+
 def test_two_day_cycle_counts_both_dates_as_one_assignment(tmp_path):
     original = make_settings(tmp_path)
     settings = replace(
