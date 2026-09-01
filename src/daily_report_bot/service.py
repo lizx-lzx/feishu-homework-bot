@@ -39,9 +39,16 @@ _NATURAL_DATED_COMPLETION_MARKER = re.compile(
     rf"(?P<label>[^#\n]{{0,30}}?)(?P<status>{_COMPLETION_STATUS})"
     rf"{_COMPLETION_STATUS_END}"
 )
+_UNDATED_COMPLETION_MARKER = re.compile(
+    rf"(?P<label>(?:第\s*)?(?:\d+|[一二三四五六七八九十]+)\s*(?:次\s*)?"
+    rf"(?:视频|图片|文字|技术)?作业(?:视频|图片|文字|技术)?)\s*"
+    rf"(?P<status>{_COMPLETION_STATUS}){_COMPLETION_STATUS_END}"
+)
 _DAY_HOMEWORK_MARKER = re.compile(r"#\s*作业\s+(?P<assignment>DAY\s*\d+)", re.IGNORECASE)
 _LATE_MARKER = re.compile(r"(?:#\s*)?补(?:提交|交|卡|打卡)")
 _MENTION_ONLY_PREFIX = re.compile(r"^(?:@[\w\u4e00-\u9fff.\-·]+ *){0,2}$")
+_RESOURCE_TOKEN = re.compile(r"\[(?:图片|文件|视频)\]")
+_MULTI_MERGE_PREFIX = "[多人合并转发]"
 _NON_HOMEWORK_LABELS = ("复盘", "迭代", "补交", "补卡")
 _LATE_TAG_WINDOW_MS = 10 * 60 * 1000
 _THREAD_HOMEWORK_TYPES = {"image", "file", "media"}
@@ -50,7 +57,8 @@ _SECOND_DAY_HOMEWORK_REACTIONS = ("WITTY", "TRICK", "Get", "HIGHFIVE", "PARTY")
 _MAKEUP_HOMEWORK_REACTIONS = ("THINKING", "OnIt", "WOW", "Get")
 _THREAD_ASSIGNMENT_LABEL = re.compile(r"(?P<label>第\s*\d+\s*次\s*作业)")
 _ASSIGNMENT_NUMBER = re.compile(
-    r"第\s*(?P<number>\d+|[一二三四五六七八九十]+)\s*(?:次(?:\s*作业)?|作业)"
+    r"(?:第\s*)?(?P<number>\d+|[一二三四五六七八九十]+)\s*"
+    r"(?:次(?:\s*作业)?|作业)"
 )
 _ASSIGNMENT_RANGE = re.compile(
     r"第\s*(?P<start>\d+|[一二三四五六七八九十]+)\s*"
@@ -62,7 +70,7 @@ _RECENT_ASSIGNMENTS = re.compile(r"这\s*(?P<count>\d+|[一二三四五六七八
 _TECH_WEEK_OVERVIEW = re.compile(r"技术周(?:整体|全部|总览|汇总|打卡情况|作业情况)?")
 _VIDEO_WEEK_OVERVIEW = re.compile(r"视频周(?:整体|全部|总览|汇总|打卡情况|作业情况)?")
 _ASSIGNMENT_LABEL_ONLY = re.compile(
-    r"^第\s*(?P<number>\d+|[一二三四五六七八九十]+)\s*(?:次\s*)?"
+    r"^(?:第\s*)?(?P<number>\d+|[一二三四五六七八九十]+)\s*(?:次\s*)?"
     r"(?:视频|图片|文字|技术)?作业(?:视频|图片|文字|技术)?$"
 )
 _THREAD_COMPLETION_TEXT = re.compile(r"^\s*(?:#\s*)?已完成\s*[.!！。]?\s*$")
@@ -79,6 +87,10 @@ _TABLE_LINK_INTENT = re.compile(
 )
 _MENU_INTENT = re.compile(r"^(?:菜单|帮助|功能|怎么玩|能做什么|使用说明)$")
 _MY_STATS_INTENT = re.compile(r"我的战绩|我的打卡|我的作业|我还差什么|我还差啥|我这次.*(?:交|完成)")
+_MY_MISSING_DETAIL_INTENT = re.compile(
+    r"我.{0,8}(?:哪|什么).{0,6}(?:次|个).{0,8}(?:没交|未交|没完成|未完成)"
+    r"|我.{0,8}(?:没交|未交|没完成|未完成).{0,8}(?:哪|什么).{0,6}(?:次|个)"
+)
 _WEEKLY_GROWTH_INTENT = re.compile(r"本周成长|成长卡|本周战报")
 _REMINDER_EXPLANATION_INTENT = re.compile(
     r"(?:你这个|这个|刚才|自动)?(?:催交|催作业|补交|补卡|未交)?"
@@ -176,6 +188,7 @@ class GroupSummaryService:
         self._bot_name_loaded = False
         self._base_record_index: Dict[str, str] = {}
         self._base_index_loaded = False
+        self._base_sync_lock = Lock()
         self._welcome_guide_lock = Lock()
 
     def _chat_allowed(self, chat_id: str) -> bool:
@@ -200,11 +213,28 @@ class GroupSummaryService:
     def _message_text(self, message: IncomingMessage) -> str:
         if message.message_type == "merge_forward":
             try:
-                return extract_merged_children(self.api.get_message_items(message.message_id)).text
+                return extract_merged_children(
+                    self.api.get_message_items(message.message_id),
+                    outer_sender_id=message.sender_open_id,
+                ).text
             except Exception:
                 logger.exception("展开合并转发失败：%s", message.message_id)
                 return "[合并转发消息]"
         return decode_content(message.message_type, message.content).text
+
+    def _implicit_submission_report_date(
+        self,
+        text: str,
+        submitted_at: datetime,
+    ) -> str:
+        """无标签附件在新旧作业窗口重叠时，优先归入当天中午到期的作业。"""
+        day = submitted_at.astimezone(self.settings.tz).date()
+        if _LATE_MARKER.search(text):
+            return self.settings.makeup_report_date(day)
+        due_report_date = self.settings.assignment_due_report_date(day)
+        if due_report_date and submitted_at <= self.settings.assignment_deadline(due_report_date):
+            return due_report_date
+        return self.settings.assignment_report_date(day)
 
     def _is_summary_command(self, text: str) -> bool:
         compact = text.strip()
@@ -897,6 +927,11 @@ class GroupSummaryService:
                 reference_day.isoformat(),
             )
             if record.homework_status != "excluded"
+            and self._attendance_record_is_in_scope(record.report_date)
+            and not (
+                record.homework_status == "missing"
+                and self.settings.assignment_deadline(record.report_date).date() > reference_day
+            )
         ]
         if not records:
             return f"{member_name}还没有可查询的打卡记录。"
@@ -936,6 +971,47 @@ class GroupSummaryService:
             f"最近一次：{status_label}｜{review_label}\n"
             f"徽章：{self._names(badges)}"
         )
+
+    def _attendance_record_is_in_scope(self, report_date: str) -> bool:
+        """保留课程阶段内记录，并兼容第一阶段开始前的旧历史数据。"""
+        phases = self.settings.configured_course_phases
+        if not phases:
+            return True
+        day = datetime.strptime(report_date, "%Y-%m-%d").date()
+        if day < phases[0].start_day:
+            return True
+        return any(phase.contains(day) for phase in phases)
+
+    def _answer_my_missing_details(
+        self,
+        message: StoredMessage,
+        reference_day: date,
+    ) -> str:
+        member_name = message.sender_name
+        if member_name not in self.settings.report_members:
+            return "你不在本群的打卡名单中，暂时没有个人记录。"
+        current_report_date = self.settings.assignment_report_date(reference_day)
+        try:
+            self.sync_attendance_date(current_report_date, message.chat_id)
+        except Exception:
+            logger.exception("查询个人未交作业前刷新打卡状态失败")
+        records = [
+            record
+            for record in self.store.list_member_attendance(
+                message.sender_open_id,
+                member_name,
+                reference_day.isoformat(),
+            )
+            if record.homework_status == "missing"
+            and self._attendance_record_is_in_scope(record.report_date)
+            and self.settings.assignment_deadline(record.report_date).date() <= reference_day
+        ]
+        if not records:
+            return f"{member_name}目前没有未交作业。"
+        lines = [f"{member_name}未交作业（{len(records)}次）："]
+        for record in records:
+            lines.append(f"• {self._assignment_period_label(record.report_date)}")
+        return "\n".join(lines)
 
     def _answer_weekly_growth(self, reference_day: date, chat_id: str) -> str:
         phase = self.settings.course_phase_for_reference(reference_day)
@@ -1419,7 +1495,14 @@ class GroupSummaryService:
         message_day = datetime.fromtimestamp(
             message.create_time_ms / 1000, tz=self.settings.tz
         ).date()
-        explicit_dates = self._submission_report_dates(message.content, message_day)
+        explicit_dates = self._submission_report_dates(
+            message.content,
+            message_day,
+            allow_embedded=(
+                message.message_type == "merge_forward"
+                and not message.content.startswith(_MULTI_MERGE_PREFIX)
+            ),
+        )
         if explicit_dates:
             return report_date in explicit_dates
 
@@ -1438,7 +1521,14 @@ class GroupSummaryService:
             root_day = datetime.fromtimestamp(
                 thread_root.create_time_ms / 1000, tz=self.settings.tz
             ).date()
-            root_dates = self._submission_report_dates(thread_root.content, root_day)
+            root_dates = self._submission_report_dates(
+                thread_root.content,
+                root_day,
+                allow_embedded=(
+                    thread_root.message_type == "merge_forward"
+                    and not thread_root.content.startswith(_MULTI_MERGE_PREFIX)
+                ),
+            )
             if root_dates:
                 return report_date in root_dates
             root_assignment = _ASSIGNMENT_NUMBER.search(thread_root.content)
@@ -1456,7 +1546,11 @@ class GroupSummaryService:
     def _homework_evidence_kind(self, message: StoredMessage) -> str:
         if message.message_type == "image" or "[图片]" in message.content:
             return "作业图片"
-        if message.message_type in {"file", "media"} or "[文件]" in message.content:
+        if (
+            message.message_type in {"file", "media", "merge_forward"}
+            or "[文件]" in message.content
+            or "[视频]" in message.content
+        ) and not message.content.startswith(_MULTI_MERGE_PREFIX):
             return "作业文件"
         if _WEB_LINK.search(message.content) and (
             _HOMEWORK_EVIDENCE_CONTEXT.search(message.content)
@@ -1617,9 +1711,12 @@ class GroupSummaryService:
         records = [
             record
             for record in records
-            if record.report_date != reference_day.isoformat()
-            or record.homework_status != "missing"
-            or record.review_status != "missing"
+            if self._attendance_record_is_in_scope(record.report_date)
+            and (
+                record.report_date != reference_day.isoformat()
+                or record.homework_status != "missing"
+                or record.review_status != "missing"
+            )
         ]
         if not records:
             return f"{member_name}还没有可查询的打卡记录。"
@@ -1691,18 +1788,68 @@ class GroupSummaryService:
             return f"第{assignment.group('number')}次作业"
         return label or "作业"
 
-    def _completion_markers_for_day(self, text: str, report_date: str) -> List[Tuple[str, int]]:
+    def _completion_markers_for_day(
+        self,
+        text: str,
+        report_date: str,
+        *,
+        reference_day: Optional[date] = None,
+    ) -> List[Tuple[str, int]]:
         report_date = self.settings.assignment_report_date(report_date)
         day = datetime.strptime(report_date, "%Y-%m-%d").date()
+        marker_reference_day = reference_day or day
         markers: List[Tuple[str, int]] = []
-        for marker_day, label, position, _is_late in self._dated_completion_markers(text, day):
+        for marker_day, label, position, _is_late in self._dated_completion_markers(
+            text, marker_reference_day
+        ):
             if self._marker_report_date(marker_day, label) != report_date:
                 continue
             markers.append((label, position))
+        for target_day, label, position, _is_late in self._undated_completion_markers(
+            text, marker_reference_day
+        ):
+            if target_day.isoformat() == report_date:
+                markers.append((label, position))
         if not _LATE_MARKER.search(text):
             for match in _DAY_HOMEWORK_MARKER.finditer(text):
                 assignment = re.sub(r"\s+", "", match.group("assignment")).upper()
                 markers.append((f"{assignment}作业", match.start()))
+        return markers
+
+    def _undated_completion_markers(
+        self,
+        text: str,
+        reference_day: date,
+    ) -> List[Tuple[date, str, int, bool]]:
+        markers: List[Tuple[date, str, int, bool]] = []
+        dated_spans = [
+            match.span()
+            for pattern in (_DATED_COMPLETION_MARKER, _NATURAL_DATED_COMPLETION_MARKER)
+            for match in pattern.finditer(text)
+        ]
+        for match in _UNDATED_COMPLETION_MARKER.finditer(text):
+            if any(start <= match.start() < end for start, end in dated_spans):
+                continue
+            label = self._clean_assignment_label(match.group("label"))
+            assignment_match = _ASSIGNMENT_NUMBER.search(label)
+            if assignment_match is None:
+                continue
+            assignment_number = self._parse_assignment_number(assignment_match.group("number"))
+            target = self.settings.assignment_date_for_number(
+                assignment_number,
+                reference_day,
+                self._course_name_hint(text),
+            )
+            if target is None or target > reference_day:
+                continue
+            markers.append(
+                (
+                    target,
+                    label,
+                    match.start(),
+                    bool(_LATE_MARKER.search(match.group("status"))),
+                )
+            )
         return markers
 
     def _marker_report_date(self, marker_day: date, label: str) -> str:
@@ -1760,12 +1907,18 @@ class GroupSummaryService:
             )
         return markers
 
-    def _submission_report_dates(self, text: str, reference_day: date) -> List[str]:
+    def _submission_report_dates(
+        self,
+        text: str,
+        reference_day: date,
+        *,
+        allow_embedded: bool = False,
+    ) -> List[str]:
         report_dates: set[str] = set()
         for candidate, label, position, _is_late in self._dated_completion_markers(
             text, reference_day
         ):
-            if not self._is_submission_marker(text, position):
+            if not allow_embedded and not self._is_submission_marker(text, position):
                 continue
             assignment_match = _ASSIGNMENT_NUMBER.search(label)
             if assignment_match:
@@ -1782,13 +1935,26 @@ class GroupSummaryService:
             ):
                 continue
             report_dates.add(self._marker_report_date(candidate, label))
+        for candidate, _label, position, _is_late in self._undated_completion_markers(
+            text, reference_day
+        ):
+            if not allow_embedded and not self._is_submission_marker(text, position):
+                continue
+            report_dates.add(candidate.isoformat())
         return sorted(report_dates)
 
     @staticmethod
     def _is_submission_marker(text: str, marker_start: int) -> bool:
         prefix = text[:marker_start].strip()
         prefix = _WEB_LINK.sub("", prefix).strip()
-        return bool(_MENTION_ONLY_PREFIX.fullmatch(prefix))
+        if prefix.startswith(_MULTI_MERGE_PREFIX):
+            return False
+        if _MENTION_ONLY_PREFIX.fullmatch(prefix):
+            return True
+        if not prefix:
+            return True
+        segments = [segment.strip() for segment in re.split(r"[；;\n]", prefix)]
+        return all(not segment or bool(_RESOURCE_TOKEN.search(segment)) for segment in segments)
 
     @staticmethod
     def _late_image_message_ids(messages: Sequence[StoredMessage]) -> set[str]:
@@ -1853,9 +2019,20 @@ class GroupSummaryService:
                 review_counts[message.sender_name] += 1
                 review_evidence[message.sender_name].append(message.message_id)
         for message in homework_source_messages:
-            for label, position in self._completion_markers_for_day(message.content, report_date):
-                marker_labels[label] += 1
-                if self._is_submission_marker(message.content, position):
+            message_day = datetime.fromtimestamp(
+                message.create_time_ms / 1000, tz=self.settings.tz
+            ).date()
+            allow_embedded = (
+                message.message_type == "merge_forward"
+                and not message.content.startswith(_MULTI_MERGE_PREFIX)
+            )
+            for label, position in self._completion_markers_for_day(
+                message.content,
+                report_date,
+                reference_day=message_day,
+            ):
+                if allow_embedded or self._is_submission_marker(message.content, position):
+                    marker_labels[label] += 1
                     marker_evidence[message.sender_name][label].append(message.message_id)
 
         homework_evidence: Dict[str, List[str]] = defaultdict(list)
@@ -1884,6 +2061,46 @@ class GroupSummaryService:
                     and not message.root_id
                 ):
                     homework_evidence[message.sender_name].append(message.message_id)
+
+        for message in homework_source_messages:
+            if (
+                message.message_type != "merge_forward"
+                or message.content.startswith(_MULTI_MERGE_PREFIX)
+                or not _RESOURCE_TOKEN.search(message.content)
+                or _LATE_MARKER.search(message.content)
+            ):
+                continue
+            message_day = datetime.fromtimestamp(
+                message.create_time_ms / 1000, tz=self.settings.tz
+            ).date()
+            explicit_dates = self._submission_report_dates(
+                message.content,
+                message_day,
+                allow_embedded=True,
+            )
+            if explicit_dates and report_date not in explicit_dates:
+                continue
+            if not explicit_dates:
+                submitted_at = datetime.fromtimestamp(
+                    message.create_time_ms / 1000,
+                    tz=self.settings.tz,
+                )
+                if (
+                    self._implicit_submission_report_date(
+                        message.content,
+                        submitted_at,
+                    )
+                    != report_date
+                ):
+                    continue
+            if message.message_id not in homework_evidence[message.sender_name]:
+                homework_evidence[message.sender_name].append(message.message_id)
+            if marker_labels:
+                homework_source = "tag+merge"
+            elif homework_source == "image":
+                cycle_number = self.settings.assignment_cycle(report_date)[2]
+                assignment_label = f"第{cycle_number}次作业"
+                homework_source = "merge"
 
         homework_members_set = {
             name for name, evidence in homework_evidence.items() if evidence and name in roster_set
@@ -1971,16 +2188,18 @@ class GroupSummaryService:
             message_day = datetime.fromtimestamp(
                 raw_message.create_time_ms / 1000, tz=self.settings.tz
             ).date()
-            for marker_day, label, position, is_late in self._dated_completion_markers(
-                raw_message.content, message_day
+            allow_embedded = (
+                raw_message.message_type == "merge_forward"
+                and not raw_message.content.startswith(_MULTI_MERGE_PREFIX)
+            )
+            matched_marker = False
+            for label, position in self._completion_markers_for_day(
+                raw_message.content,
+                report_date,
+                reference_day=message_day,
             ):
-                if not self._is_submission_marker(raw_message.content, position):
-                    continue
-                marker_report_date = self._marker_report_date(marker_day, label)
-                if marker_report_date != report_date and not (
-                    not self.settings.configured_course_phases
-                    and is_late
-                    and marker_day == message_day
+                if not allow_embedded and not self._is_submission_marker(
+                    raw_message.content, position
                 ):
                     continue
                 if expected_label not in {"图片作业", "话题作业"} and label != expected_label:
@@ -1990,7 +2209,50 @@ class GroupSummaryService:
                 late_labels[label] += 1
                 facts["homework_evidence"][name].append(raw_message.message_id)
                 late_members.add(name)
+                matched_marker = True
                 break
+            if matched_marker:
+                continue
+            if not self.settings.configured_course_phases:
+                for marker_day, label, position, is_late in self._dated_completion_markers(
+                    raw_message.content,
+                    message_day,
+                ):
+                    if not is_late or marker_day != message_day:
+                        continue
+                    if not self._is_submission_marker(raw_message.content, position):
+                        continue
+                    if expected_label not in {"图片作业", "话题作业"} and label != expected_label:
+                        continue
+                    if not self._homework_evidence_kind(raw_message):
+                        continue
+                    late_labels[label] += 1
+                    facts["homework_evidence"][name].append(raw_message.message_id)
+                    late_members.add(name)
+                    matched_marker = True
+                    break
+            if matched_marker:
+                continue
+            if (
+                raw_message.message_type == "merge_forward"
+                and not raw_message.content.startswith(_MULTI_MERGE_PREFIX)
+                and _RESOURCE_TOKEN.search(raw_message.content)
+                and not self._submission_report_dates(
+                    raw_message.content,
+                    message_day,
+                    allow_embedded=True,
+                )
+                and self._implicit_submission_report_date(
+                    raw_message.content,
+                    datetime.fromtimestamp(
+                        raw_message.create_time_ms / 1000,
+                        tz=self.settings.tz,
+                    ),
+                )
+                == report_date
+            ):
+                facts["homework_evidence"][name].append(raw_message.message_id)
+                late_members.add(name)
         if expected_label == "图片作业" and late_labels:
             facts["assignment_label"] = late_labels.most_common(1)[0][0]
             facts["homework_source"] = "tag"
@@ -2298,6 +2560,13 @@ class GroupSummaryService:
         return updated
 
     def _sync_attendance_to_base(self, records: Sequence[AttendanceRecord]) -> Dict[str, int]:
+        with self._base_sync_lock:
+            return self._sync_attendance_to_base_locked(records)
+
+    def _sync_attendance_to_base_locked(
+        self,
+        records: Sequence[AttendanceRecord],
+    ) -> Dict[str, int]:
         if not self.settings.base_sync_enabled:
             return {"created": 0, "updated": 0, "skipped": len(records)}
         self._load_base_record_index()
@@ -2346,6 +2615,9 @@ class GroupSummaryService:
         return counts
 
     def sync_attendance_date(self, report_date: str, chat_id: str) -> int:
+        if not self._attendance_record_is_in_scope(report_date):
+            logger.info("日期位于课程阶段空档，跳过打卡同步：%s %s", report_date, chat_id)
+            return 0
         report_date = self.settings.assignment_report_date(report_date)
         cycle_start, cycle_end, _ = self.settings.assignment_cycle(report_date)
         start_ms, _ = _day_range_ms(cycle_start, self.settings.tz)
@@ -2733,20 +3005,28 @@ class GroupSummaryService:
             return True
         report_dates: List[str] = []
         if inserted:
-            report_dates = self._submission_report_dates(text, submitted_at.date())
+            report_dates = self._submission_report_dates(
+                text,
+                submitted_at.date(),
+                allow_embedded=(
+                    stored.message_type == "merge_forward"
+                    and not stored.content.startswith(_MULTI_MERGE_PREFIX)
+                ),
+            )
             if (
                 not report_dates
                 and (
                     stored.message_type in _THREAD_HOMEWORK_TYPES
-                    or "[图片]" in stored.content
+                    or bool(_RESOURCE_TOKEN.search(stored.content))
                     or self._is_thread_homework(stored)
                 )
+                and not stored.content.startswith(_MULTI_MERGE_PREFIX)
                 and (
                     not self.settings.configured_course_phases
                     or self.settings.course_is_active(submitted_at.date())
                 )
             ):
-                report_dates = [self.settings.assignment_report_date(submitted_at.date())]
+                report_dates = [self._implicit_submission_report_date(text, submitted_at)]
             for report_date in report_dates:
                 try:
                     self.sync_attendance_date(report_date, message.chat_id)
@@ -2773,6 +3053,13 @@ class GroupSummaryService:
                     message.message_id,
                     self._answer_table_link(),
                     f"table-link-{message.message_id}",
+                )
+                return True
+            if _MY_MISSING_DETAIL_INTENT.search(mentioned_query):
+                self.api.reply_post(
+                    message.message_id,
+                    self._answer_my_missing_details(stored, submitted_at.date()),
+                    f"my-missing-details-{message.message_id}",
                 )
                 return True
             if _MY_STATS_INTENT.search(mentioned_query):

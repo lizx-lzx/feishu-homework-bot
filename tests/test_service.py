@@ -1584,6 +1584,44 @@ def test_bot_mention_can_query_one_members_full_history(tmp_path):
     assert "8月10日（前置作业）：🟡 补卡｜✅ 已复盘" in reply
 
 
+def test_personal_missing_query_lists_periods_and_ignores_course_gap(tmp_path):
+    settings = with_video_week(make_settings(tmp_path))
+    api = FakeApi()
+    store = LocalStore(settings.db_path)
+    service = GroupSummaryService(settings, api, FakeSummarizer(), store)
+    for report_date, label in (
+        ("2026-08-27", "第6次作业"),
+        ("2026-08-29", "第2次作业"),
+    ):
+        store.replace_daily_attendance(
+            [
+                AttendanceRecord(
+                    report_date=report_date,
+                    member_key="ou_1",
+                    sender_open_id="ou_1",
+                    sender_name="小李",
+                    assignment_label=label,
+                    homework_status="missing",
+                    review_status="missing",
+                    homework_source="tag",
+                )
+            ]
+        )
+
+    service.handle_message(
+        incoming(
+            "om_my_missing",
+            "@知识库助手 我是哪两次未交",
+            created_at=datetime(2026, 9, 1, 20, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+    )
+
+    reply = api.replies[-1][1]
+    assert "小李未交作业（1次）" in reply
+    assert "8月29日" in reply
+    assert "8月27日" not in reply
+
+
 def test_bot_mention_of_unrelated_question_explains_scope(tmp_path):
     _, api, _, _, service = make_service(tmp_path)
 
@@ -2106,6 +2144,35 @@ def test_base_sync_is_idempotent_and_writes_cumulative_fields(tmp_path):
     assert by_name["小王"]["作业状态"] == "未提交"
     assert by_name["小王"]["旷卡累计"] == 1
     assert api.base_updates == []
+
+
+def test_concurrent_base_sync_does_not_create_duplicate_record_keys(tmp_path):
+    settings = replace(
+        make_settings(tmp_path),
+        base_sync_enabled=True,
+        base_token="bas_test",
+        base_table_id="tbl_test",
+    )
+    api = FakeApi()
+    store = LocalStore(settings.db_path)
+    service = GroupSummaryService(settings, api, FakeSummarizer(), store)
+    records = [
+        AttendanceRecord(
+            report_date="2026-08-11",
+            member_key="ou_1",
+            sender_open_id="ou_1",
+            sender_name="小李",
+            assignment_label="图片作业",
+            homework_status="completed",
+            review_status="missing",
+            homework_source="image",
+        )
+    ]
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        list(executor.map(lambda _: service._sync_attendance_to_base(records), range(2)))
+
+    assert [record["fields"]["记录键"] for record in api.base_records] == ["2026-08-11|ou_1"]
 
 
 def test_base_sync_writes_assignment_cycle_fields(tmp_path):
@@ -3251,6 +3318,169 @@ def test_video_assignment_label_and_trailing_note_are_recognized(tmp_path):
     assert facts["homework_members"] == ["凡", "cove"]
     assert facts["homework_evidence"]["凡"] == ["om_video_first_version"]
     assert facts["homework_evidence"]["cove"] == ["om_video_complete"]
+
+
+def test_merged_forward_accepts_tag_after_file_and_uses_outer_sender(tmp_path):
+    settings = with_video_week(make_settings(tmp_path))
+    api = FakeApi()
+    store = LocalStore(settings.db_path)
+    service = GroupSummaryService(settings, api, FakeSummarizer(), store)
+    api.message_items["om_merge"] = [
+        {"msg_type": "merge_forward", "sender": {"id": "ou_1"}},
+        {
+            "msg_type": "file",
+            "sender": {"id": "ou_1"},
+            "body": {
+                "content": json.dumps(
+                    {"file_key": "file_x", "file_name": "作业.md"},
+                    ensure_ascii=False,
+                )
+            },
+        },
+        {
+            "msg_type": "text",
+            "sender": {"id": "ou_1"},
+            "body": {
+                "content": json.dumps(
+                    {"text": "#9月1日 第4次作业已完成\n昵称：模板旧名\n作业说明：完成分镜"},
+                    ensure_ascii=False,
+                )
+            },
+        },
+    ]
+
+    service.handle_message(
+        incoming(
+            "om_merge",
+            "Merged and Forwarded Message",
+            message_type="merge_forward",
+            created_at=datetime(2026, 9, 1, 11, 30, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+    )
+
+    attendance = {
+        record.sender_name: record for record in store.list_daily_attendance("2026-08-31")
+    }
+    assert attendance["小李"].homework_status == "completed"
+    assert attendance["小李"].homework_message_ids == ("om_merge",)
+
+
+def test_multi_sender_merged_forward_is_not_auto_counted(tmp_path):
+    settings = with_video_week(make_settings(tmp_path))
+    api = FakeApi()
+    store = LocalStore(settings.db_path)
+    service = GroupSummaryService(settings, api, FakeSummarizer(), store)
+    api.message_items["om_multi_merge"] = [
+        {"msg_type": "merge_forward", "sender": {"id": "ou_1"}},
+        {
+            "msg_type": "image",
+            "sender": {"id": "ou_1"},
+            "body": {"content": json.dumps({"image_key": "img_x"})},
+        },
+        {
+            "msg_type": "text",
+            "sender": {"id": "ou_2"},
+            "body": {
+                "content": json.dumps(
+                    {"text": "#9月1日 第4次作业已完成"},
+                    ensure_ascii=False,
+                )
+            },
+        },
+    ]
+
+    service.handle_message(
+        incoming(
+            "om_multi_merge",
+            "Merged and Forwarded Message",
+            message_type="merge_forward",
+            created_at=datetime(2026, 9, 1, 11, 30, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+    )
+
+    assert store.list_daily_attendance("2026-08-31") == []
+
+
+def test_undated_short_makeup_label_is_recognized_but_cutoff_stays_strict(tmp_path):
+    settings = with_video_week(make_settings(tmp_path))
+    store = LocalStore(settings.db_path)
+    service = GroupSummaryService(settings, FakeApi(), FakeSummarizer(), store)
+    text = "[图片] 2次作业补交已完成\n作业说明：补齐视频资产"
+
+    assert service._submission_report_dates(text, date(2026, 8, 30)) == ["2026-08-29"]
+
+    service.handle_message(
+        incoming(
+            "om_short_makeup",
+            text,
+            created_at=datetime(2026, 8, 30, 21, 30, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+    )
+    attendance = {
+        record.sender_name: record for record in store.list_daily_attendance("2026-08-29")
+    }
+    assert attendance["小李"].homework_status == "late"
+
+    late_store = LocalStore(tmp_path / "late.sqlite3")
+    late_service = GroupSummaryService(settings, FakeApi(), FakeSummarizer(), late_store)
+    late_service.handle_message(
+        incoming(
+            "om_after_cutoff",
+            text,
+            created_at=datetime(2026, 8, 30, 22, 19, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+    )
+    after_cutoff = {
+        record.sender_name: record for record in late_store.list_daily_attendance("2026-08-29")
+    }
+    assert after_cutoff["小李"].homework_status == "missing"
+
+
+def test_untagged_resource_uses_previous_assignment_until_noon(tmp_path):
+    settings = with_video_week(make_settings(tmp_path))
+    service = GroupSummaryService(
+        settings,
+        FakeApi(),
+        FakeSummarizer(),
+        LocalStore(settings.db_path),
+    )
+
+    assert (
+        service._implicit_submission_report_date(
+            "[文件] 分镜.md",
+            datetime(2026, 9, 1, 11, 59, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+        == "2026-08-31"
+    )
+    assert (
+        service._implicit_submission_report_date(
+            "[文件] 分镜.md",
+            datetime(2026, 9, 1, 12, 1, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+        == "2026-09-01"
+    )
+
+
+def test_course_gap_does_not_create_attendance_rows(tmp_path):
+    settings = with_video_week(make_settings(tmp_path))
+    store = LocalStore(settings.db_path)
+    service = GroupSummaryService(settings, FakeApi(), FakeSummarizer(), store)
+    store.add_message(
+        StoredMessage(
+            message_id="om_gap",
+            chat_id="oc_group",
+            sender_open_id="ou_1",
+            sender_name="小李",
+            message_type="image",
+            content="[图片]",
+            create_time_ms=int(
+                datetime(2026, 8, 27, 20, 0, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp() * 1000
+            ),
+        )
+    )
+
+    assert service.sync_attendance_date("2026-08-27", "oc_group") == 0
+    assert store.list_daily_attendance("2026-08-27") == []
 
 
 def test_completion_question_is_not_treated_as_submission(tmp_path):

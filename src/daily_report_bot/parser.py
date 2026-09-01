@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, List, Sequence, Tuple
 
 from .models import ParsedContent
 
@@ -87,7 +87,10 @@ def decode_content(message_type: str, content: str) -> ParsedContent:
     if message_type == "post":
         parts: List[str] = []
         if isinstance(payload, dict):
-            _walk_post(payload, parts)
+            # 飞书新版 post 会同时返回内容相同的 content 与 content_v2。
+            # 遍历整个 payload 会把作业正文和图片各记录两遍。
+            post_body = payload.get("content_v2") or payload.get("content") or payload
+            _walk_post(post_body, parts)
         return ParsedContent(text=" ".join(part.strip() for part in parts if part.strip()))
 
     if message_type == "file":
@@ -109,17 +112,36 @@ def decode_content(message_type: str, content: str) -> ParsedContent:
     return ParsedContent(text=str(payload).strip() if payload else "")
 
 
-def extract_merged_children(items: Sequence[Dict[str, Any]]) -> ParsedContent:
-    parts: List[str] = []
+def extract_merged_children(
+    items: Sequence[Dict[str, Any]],
+    *,
+    outer_sender_id: str = "",
+) -> ParsedContent:
+    parts: List[Tuple[str, str]] = []
+    child_sender_ids: set[str] = set()
     for item in items:
         message_type = str(item.get("msg_type") or item.get("message_type") or "")
         if message_type == "merge_forward":
             continue
+        sender = item.get("sender") or {}
+        sender_id = str(sender.get("id") or "") if isinstance(sender, dict) else ""
+        if sender_id:
+            child_sender_ids.add(sender_id)
         body = item.get("body") if isinstance(item.get("body"), dict) else {}
         parsed = decode_content(message_type, str(body.get("content") or item.get("content") or ""))
         if not parsed.text:
             continue
-        sender = item.get("sender") or {}
         name = sender.get("name") if isinstance(sender, dict) else ""
-        parts.append(f"{name}：{parsed.text}" if name else parsed.text)
-    return ParsedContent(text="；".join(parts))
+        parts.append((sender_id, f"{name}：{parsed.text}" if name else parsed.text))
+
+    is_multi_sender = bool(
+        len(child_sender_ids) > 1
+        or (
+            outer_sender_id
+            and child_sender_ids
+            and any(sender_id != outer_sender_id for sender_id in child_sender_ids)
+        )
+    )
+    text_parts = [text for _, text in parts]
+    prefix = "[多人合并转发] " if is_multi_sender else ""
+    return ParsedContent(text=prefix + "；".join(text_parts))

@@ -23,6 +23,13 @@ def test_decode_post_keeps_text_mentions_and_image_placeholder():
     assert decode_content("post", content).text == "进展 @小李 [图片]"
 
 
+def test_decode_post_does_not_duplicate_content_v2():
+    body = [[{"tag": "text", "text": "第4次作业已完成"}], [{"tag": "img"}]]
+    content = json.dumps({"content": body, "content_v2": body}, ensure_ascii=False)
+
+    assert decode_content("post", content).text == "第4次作业已完成 [图片]"
+
+
 def test_decode_media_as_readable_placeholder():
     assert decode_content("image", '{"image_key":"img_x"}').text == "[图片]"
     assert decode_content("audio", '{"file_key":"file_x"}').text == "[语音]"
@@ -60,3 +67,23 @@ def test_extract_merged_children_keeps_readable_content():
         },
     ]
     assert extract_merged_children(items).text == "小李：决定周五上线；小王：[图片]"
+
+
+def test_extract_merged_children_marks_multiple_senders():
+    items = [
+        {"msg_type": "merge_forward", "sender": {"id": "ou_outer"}},
+        {
+            "msg_type": "text",
+            "sender": {"id": "ou_outer", "name": "小李"},
+            "body": {"content": json.dumps({"text": "我的作业"}, ensure_ascii=False)},
+        },
+        {
+            "msg_type": "text",
+            "sender": {"id": "ou_other", "name": "小王"},
+            "body": {"content": json.dumps({"text": "收到"}, ensure_ascii=False)},
+        },
+    ]
+
+    parsed = extract_merged_children(items, outer_sender_id="ou_outer")
+
+    assert parsed.text == "[多人合并转发] 小李：我的作业；小王：收到"
