@@ -2,7 +2,7 @@ import json
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -50,14 +50,40 @@ class FakeApi:
         self.reactions.append((message_id, emoji_type))
         return f"reaction_{len(self.reactions)}"
 
-    def send_attendance_reminder(self, chat_id, members, homework_missing, review_missing, uuid):
+    def send_attendance_reminder(
+        self,
+        chat_id,
+        members,
+        homework_missing,
+        review_missing,
+        uuid,
+        *,
+        pending_members=(),
+    ):
         self.reminders.append(
-            (chat_id, list(members), list(homework_missing), list(review_missing), uuid)
+            (
+                chat_id,
+                list(members),
+                list(homework_missing),
+                list(review_missing),
+                uuid,
+                list(pending_members),
+            )
         )
         return "om_reminder"
 
-    def send_makeup_reminder(self, chat_id, members, homework_missing, uuid):
-        self.makeup_reminders.append((chat_id, list(members), list(homework_missing), uuid))
+    def send_makeup_reminder(
+        self,
+        chat_id,
+        members,
+        homework_missing,
+        uuid,
+        *,
+        pending_members=(),
+    ):
+        self.makeup_reminders.append(
+            (chat_id, list(members), list(homework_missing), uuid, list(pending_members))
+        )
         return "om_makeup_reminder"
 
     def list_base_records(self, base_token, table_id):
@@ -2291,10 +2317,11 @@ def test_reminder_mentions_missing_union_once_and_is_idempotent(tmp_path):
     assert first == "om_reminder"
     assert second == ""
     assert len(api.reminders) == 1
-    _, mentions, homework_missing, review_missing, _ = api.reminders[0]
+    _, mentions, homework_missing, review_missing, _, pending = api.reminders[0]
     assert mentions == [("ou_2", "小王")]
     assert homework_missing == ["小王"]
     assert review_missing == []
+    assert pending == []
 
 
 def test_two_day_assignment_cycle_uses_second_day_deadline(tmp_path):
@@ -2581,9 +2608,10 @@ def test_makeup_notifications_run_on_third_day_and_split_final_status(tmp_path):
     assert service.send_due_makeup_reminders("2026-08-10") == []
     assert service.send_due_makeup_reminders("2026-08-11") == ["om_makeup_reminder"]
     assert service.send_due_makeup_reminders("2026-08-11") == []
-    _, mentions, missing, _ = api.makeup_reminders[0]
+    _, mentions, missing, _, pending = api.makeup_reminders[0]
     assert mentions == [("ou_3", "小周")]
     assert missing == ["小周"]
+    assert pending == []
 
     assert service.send_due_makeup_summaries("2026-08-10") == []
     assert service.send_due_makeup_summaries("2026-08-11") == ["om_summary"]
@@ -3163,19 +3191,19 @@ def test_daily_phase_classifies_next_day_noon_and_ten_pm_boundaries(tmp_path):
     submissions = (
         (
             "om_normal_before_noon",
-            "#0825 第6次作业已完成\n作业说明：正常提交",
+            "#0825 第6次作业已完成\n[视频]\n作业说明：正常提交",
             "ou_1",
             datetime(2026, 8, 26, 11, 59, tzinfo=ZoneInfo("Asia/Shanghai")),
         ),
         (
             "om_makeup_after_noon",
-            "#0825 第6次作业已完成\n作业说明：补交",
+            "#0825 第6次作业已完成\n[视频]\n作业说明：补交",
             "ou_2",
             datetime(2026, 8, 26, 12, 1, tzinfo=ZoneInfo("Asia/Shanghai")),
         ),
         (
             "om_too_late_at_ten",
-            "#0825 第6次作业已完成\n作业说明：超时提交",
+            "#0825 第6次作业已完成\n[视频]\n作业说明：超时提交",
             "ou_3",
             datetime(2026, 8, 26, 22, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
         ),
@@ -3248,7 +3276,7 @@ def test_video_week_submission_and_makeup_use_expected_reactions(tmp_path, monke
         service.handle_message(
             incoming(
                 "om_video_normal",
-                "#8月20日 第1次作业已完成\n作业说明：已完成视频练习",
+                "#8月20日 第1次作业已完成\n[视频]\n作业说明：已完成视频练习",
                 created_at=datetime(2026, 8, 20, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
             )
         )
@@ -3260,7 +3288,7 @@ def test_video_week_submission_and_makeup_use_expected_reactions(tmp_path, monke
         service.handle_message(
             incoming(
                 "om_video_makeup",
-                "#8月20日 第1次作业已补交\n作业说明：已补交视频练习",
+                "#8月20日 第1次作业已补交\n[视频]\n作业说明：已补交视频练习",
                 sender_open_id="ou_2",
                 created_at=datetime(2026, 8, 21, 13, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
             )
@@ -3295,10 +3323,25 @@ def test_video_assignment_label_and_trailing_note_are_recognized(tmp_path):
     )
     service.handle_message(
         incoming(
+            "om_video_first_asset",
+            "[视频]",
+            created_at=datetime(2026, 8, 28, 15, 54, 2, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+    )
+    service.handle_message(
+        incoming(
             "om_video_complete",
             "#8月28日  第1次作业视频已完成",
             sender_open_id="ou_2",
             created_at=datetime(2026, 8, 28, 16, 8, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+    )
+    service.handle_message(
+        incoming(
+            "om_video_second_asset",
+            "[视频]",
+            sender_open_id="ou_2",
+            created_at=datetime(2026, 8, 28, 16, 8, 2, tzinfo=ZoneInfo("Asia/Shanghai")),
         )
     )
 
@@ -3316,8 +3359,126 @@ def test_video_assignment_label_and_trailing_note_are_recognized(tmp_path):
 
     assert facts["assignment_label"] == "第1次作业"
     assert facts["homework_members"] == ["凡", "cove"]
-    assert facts["homework_evidence"]["凡"] == ["om_video_first_version"]
-    assert facts["homework_evidence"]["cove"] == ["om_video_complete"]
+    assert facts["homework_evidence"]["凡"] == [
+        "om_video_first_version",
+        "om_video_first_asset",
+    ]
+    assert facts["homework_evidence"]["cove"] == [
+        "om_video_complete",
+        "om_video_second_asset",
+    ]
+
+
+def test_video_submission_word_and_separate_file_count_as_real_submission(tmp_path):
+    settings = with_video_week(make_settings(tmp_path))
+    store = LocalStore(settings.db_path)
+    service = GroupSummaryService(settings, FakeApi(), FakeSummarizer(), store)
+    submitted_at = datetime(2026, 9, 1, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    service.handle_message(
+        incoming(
+            "om_submit_marker",
+            "#9月1日 第5次作业提交",
+            created_at=submitted_at,
+        )
+    )
+    service.handle_message(
+        incoming(
+            "om_submit_file",
+            "范式试片-连续世界.html",
+            message_type="file",
+            created_at=submitted_at + timedelta(seconds=2),
+        )
+    )
+
+    attendance = {
+        record.sender_name: record for record in store.list_daily_attendance("2026-09-01")
+    }
+    assert attendance["小李"].homework_status == "completed"
+    assert attendance["小李"].homework_message_ids == (
+        "om_submit_marker",
+        "om_submit_file",
+    )
+
+
+def test_video_declaration_without_artifact_is_pending_before_cutoff(tmp_path, monkeypatch):
+    class BeforeCutoffDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            current = cls(2026, 9, 1, 12, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+            return current.astimezone(tz) if tz is not None else current.replace(tzinfo=None)
+
+    monkeypatch.setattr("daily_report_bot.service.datetime", BeforeCutoffDateTime)
+    settings = with_video_week(make_settings(tmp_path))
+    store = LocalStore(settings.db_path)
+    service = GroupSummaryService(settings, FakeApi(), FakeSummarizer(), store)
+    service.handle_message(
+        incoming(
+            "om_claim_only",
+            "#9月1日 第5次作业已完成\n作业说明：已完成视频练习",
+            created_at=datetime(2026, 9, 1, 11, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+    )
+    messages = store.list_messages("oc_group", 0, 9_999_999_999_999, 100)
+
+    facts = service._completion_facts("2026-09-01", messages, homework_messages=messages)
+
+    assert facts["homework_members"] == []
+    assert facts["pending_members"] == ["小李"]
+    assert facts["none"] == ["小王"]
+    attendance = {
+        record.sender_name: record for record in store.list_daily_attendance("2026-09-01")
+    }
+    assert attendance["小李"].homework_status == "pending"
+    fields = service._base_fields_for_attendance(
+        AttendanceRecord(
+            report_date="2026-09-01",
+            member_key="ou_1",
+            sender_open_id="ou_1",
+            sender_name="小李",
+            assignment_label="第5次作业",
+            homework_status="pending",
+            review_status="missing",
+            homework_source="tag",
+        )
+    )
+    assert fields["作业状态"] == "待核验"
+
+
+def test_video_artifact_is_assigned_to_nearest_submission_declaration(tmp_path):
+    settings = with_video_week(make_settings(tmp_path))
+    store = LocalStore(settings.db_path)
+    service = GroupSummaryService(settings, FakeApi(), FakeSummarizer(), store)
+    base_time = datetime(2026, 9, 1, 21, 3, 39, tzinfo=ZoneInfo("Asia/Shanghai"))
+    submissions = (
+        ("om_fourth", "#9月1日 第4次作业提交", base_time),
+        ("om_video", "[视频]", base_time + timedelta(seconds=33)),
+        ("om_fifth", "#9月1日 第5次作业提交", base_time + timedelta(seconds=62)),
+        ("om_image", "[图片]", base_time + timedelta(seconds=193)),
+    )
+    for message_id, text, created_at in submissions:
+        service.handle_message(incoming(message_id, text, created_at=created_at))
+    messages = store.list_messages("oc_group", 0, 9_999_999_999_999, 100)
+
+    fourth = service._completion_facts("2026-08-31", messages, homework_messages=messages)
+    fifth = service._completion_facts("2026-09-01", messages, homework_messages=messages)
+
+    assert fourth["homework_members"] == []
+    assert fourth["pending_members"] == ["小李"]
+    assert fifth["homework_members"] == ["小李"]
+    assert fifth["homework_evidence"]["小李"] == [
+        "om_fifth",
+        "om_video",
+        "om_image",
+    ]
+    fourth_attendance = {
+        record.sender_name: record for record in store.list_daily_attendance("2026-08-31")
+    }
+    fifth_attendance = {
+        record.sender_name: record for record in store.list_daily_attendance("2026-09-01")
+    }
+    assert fourth_attendance["小李"].homework_status == "missing"
+    assert fifth_attendance["小李"].homework_status == "completed"
 
 
 def test_merged_forward_accepts_tag_after_file_and_uses_outer_sender(tmp_path):

@@ -47,6 +47,23 @@ def test_manual_status_is_leader_owned_and_excluded_from_status_views() -> None:
         ]
 
 
+def test_system_status_and_pending_view_include_verification_state() -> None:
+    schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+    fields = {field["name"]: field for field in schema["fields"]}
+    system = fields["作业状态"]
+    pending_view = next(view for view in schema["views"] if view["name"] == "本周期待提交")
+
+    assert {option["name"] for option in system["options"]} == {
+        "已提交",
+        "补卡",
+        "待核验",
+        "未提交",
+    }
+    assert ["作业状态", "intersects", ["待核验", "未提交"]] in pending_view[
+        "filter"
+    ]["conditions"]
+
+
 def test_every_view_uses_current_cycle_instead_of_relative_dates() -> None:
     schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
 

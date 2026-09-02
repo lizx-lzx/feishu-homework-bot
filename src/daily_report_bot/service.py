@@ -26,7 +26,8 @@ _EXPLICIT_REVIEW_DATE = re.compile(
 _REVIEW_MARKER = re.compile(r"#\s*[^#\n]{0,24}?复盘(?:打卡|总结)?")
 _COMPLETION_STATUS = (
     r"已完成补打卡|已完成补提交|已完成补交|已完成补卡|补交打卡|"
-    r"已补打卡|补打卡|已补提交|补提交|已补交|补交|已补卡|补卡|已完成|完成"
+    r"已补打卡|补打卡|已补提交|补提交|已补交|补交|已补卡|补卡|"
+    r"已提交|提交|已完成|完成"
 )
 _COMPLETION_STATUS_END = r"(?!情况|要求|格式|了吗|吗|么|不了|度|率)"
 _DATED_COMPLETION_MARKER = re.compile(
@@ -154,6 +155,10 @@ _HOMEWORK_EVIDENCE_DETAIL = re.compile(
     r"课程\s*[:：]|作品说明|交付成果"
 )
 _HOMEWORK_EVIDENCE_CONTEXT = re.compile(r"作业|打卡|作品|成果|课程")
+_TEXT_ARTIFACT_FIELD = re.compile(
+    r"(?:交付成果|作品正文|成品内容|剧本正文|分镜正文|完整提示词|代码正文)"
+    r"\s*[:：]\s*(?=\S)"
+)
 _MEMBER_HISTORY_INTENT = re.compile(
     r"(?:全部|所有|历史).*(?:打卡|作业|复盘|记录|状态|情况)"
     r"|(?:打卡|作业|复盘).*(?:全部|所有|历史)"
@@ -429,7 +434,12 @@ class GroupSummaryService:
         if not self.settings.base_sync_enabled:
             return {}
         wanted = set(report_dates)
-        system_statuses = {"已提交": "completed", "补卡": "late", "未提交": "missing"}
+        system_statuses = {
+            "已提交": "completed",
+            "补卡": "late",
+            "待核验": "pending",
+            "未提交": "missing",
+        }
         statuses: Dict[Tuple[str, str], str] = {}
         for record in self.api.list_base_records(
             self.settings.base_token,
@@ -486,6 +496,7 @@ class GroupSummaryService:
 
         normal_total = 0
         late_total = 0
+        pending_total = 0
         missing_total = 0
         slot_total = 0
         status_history: Dict[str, List[str]] = defaultdict(list)
@@ -528,6 +539,7 @@ class GroupSummaryService:
             ]
             normal = [name for name in active_names if status_by_name.get(name) == "completed"]
             late = [name for name in active_names if status_by_name.get(name) == "late"]
+            pending = [name for name in active_names if status_by_name.get(name) == "pending"]
             missing = [
                 name for name in active_names if status_by_name.get(name, "missing") == "missing"
             ]
@@ -536,6 +548,7 @@ class GroupSummaryService:
 
             normal_total += len(normal)
             late_total += len(late)
+            pending_total += len(pending)
             missing_total += len(missing)
             slot_total += len(active_names)
             cycle_start, cycle_end, _ = self.settings.assignment_cycle(report_date)
@@ -545,13 +558,16 @@ class GroupSummaryService:
             lines.extend(
                 [
                     f"第{assignment_number}次（{period}）：正常 {len(normal)}｜补卡 {len(late)}｜"
-                    f"最终 {len(normal) + len(late)}/{len(active_names)}｜未交 {len(missing)}",
+                    + (f"待核验 {len(pending)}｜" if pending else "")
+                    + f"最终 {len(normal) + len(late)}/{len(active_names)}｜"
+                    f"未交 {len(missing)}",
                     f"正常：{self._names(normal)}",
                     f"补卡：{self._names(late)}",
-                    f"未交：{self._names(missing)}",
-                    "",
                 ]
             )
+            if pending:
+                lines.append(f"待核验：{self._names(pending)}")
+            lines.extend([f"未交：{self._names(missing)}", ""])
 
         if not available_cycles:
             return "所选作业周期暂无可核验的已存打卡数据。"
@@ -562,11 +578,13 @@ class GroupSummaryService:
             if len(status_history[name]) == available_cycles
             and all(status in {"completed", "late"} for status in status_history[name])
         ]
+        pending_summary = f"待核验 {pending_total}｜" if pending_total else ""
         lines.extend(
             [
                 "多周期总览",
                 f"累计作业人次：正常 {normal_total}｜补卡 {late_total}｜"
-                f"最终完成 {normal_total + late_total}/{slot_total}｜未交 {missing_total}",
+                f"{pending_summary}最终完成 {normal_total + late_total}/{slot_total}｜"
+                f"未交 {missing_total}",
                 f"所选周期全部完成（{len(fully_completed)}人）：{self._names(fully_completed)}",
                 "",
                 (
@@ -938,6 +956,7 @@ class GroupSummaryService:
 
         normal = sum(record.homework_status == "completed" for record in records)
         late = sum(record.homework_status == "late" for record in records)
+        pending = sum(record.homework_status == "pending" for record in records)
         missing = sum(record.homework_status == "missing" for record in records)
         reviewed = sum(record.review_status == "completed" for record in records)
         normal_streak = 0
@@ -952,6 +971,7 @@ class GroupSummaryService:
         status_label = {
             "completed": "✅ 正常提交",
             "late": "🟡 补卡",
+            "pending": "🟠 待核验",
             "missing": "❌ 未提交",
         }.get(current.homework_status, current.homework_status)
         review_label = "✅ 已复盘" if current.review_status == "completed" else "❌ 未复盘"
@@ -964,9 +984,11 @@ class GroupSummaryService:
             badges.append("📝 复盘连击")
         if late:
             badges.append("🟡 补卡归队")
+        pending_summary = f"｜待核验 {pending} 次" if pending else ""
         return (
             f"🎮 {member_name}・我的战绩\n\n"
-            f"累计：正常 {normal} 次｜补卡 {late} 次｜未交 {missing} 次\n"
+            f"累计：正常 {normal} 次｜补卡 {late} 次{pending_summary}｜"
+            f"未交 {missing} 次\n"
             f"复盘：{reviewed}/{len(records)}｜连续正常提交 {normal_streak} 次\n\n"
             f"最近一次：{status_label}｜{review_label}\n"
             f"徽章：{self._names(badges)}"
@@ -1441,23 +1463,32 @@ class GroupSummaryService:
             label = facts["assignment_label"]
 
         completed_set = set(completed)
-        missing = [name for name in roster if name not in completed_set]
+        pending = (
+            [] if wants_review and not wants_homework else list(facts.get("pending_members", ()))
+        )
+        pending_set = set(pending)
+        missing = [name for name in roster if name not in completed_set and name not in pending_set]
         if not (wants_review and not wants_homework):
             late = list(facts["late_members"])
             late_set = set(late)
             normal = [name for name in completed if name not in late_set]
             if _COMPLETED_INTENT.search(question) and not _MISSING_INTENT.search(question):
-                return (
+                reply = (
                     f"{day_label}{label}已提交 {len(completed)}/{total}。\n"
                     f"正常提交（{len(normal)}人）：{self._names(normal)}\n"
                     f"已补交（{len(late)}人）：{self._names(late)}"
                 )
-            return (
+                if pending:
+                    reply += f"\n待核验（{len(pending)}人）：{self._names(pending)}"
+                return reply
+            reply = (
                 f"{day_label}{label}已提交 {len(completed)}/{total}"
                 f"（正常提交 {len(normal)}，已补交 {len(late)}）。\n"
-                f"已补交（{len(late)}人）：{self._names(late)}\n"
-                f"仍未交（{len(missing)}人）：{self._names(missing)}"
+                f"已补交（{len(late)}人）：{self._names(late)}"
             )
+            if pending:
+                reply += f"\n待核验（{len(pending)}人）：{self._names(pending)}"
+            return reply + f"\n仍未交（{len(missing)}人）：{self._names(missing)}"
         if _COMPLETED_INTENT.search(question) and not _MISSING_INTENT.search(question):
             return (
                 f"{day_label}{label}已完成 {len(completed)}/{total}。\n"
@@ -1543,7 +1574,12 @@ class GroupSummaryService:
             return True
         return abs(message.create_time_ms - claim_message.create_time_ms) <= _LATE_TAG_WINDOW_MS
 
-    def _homework_evidence_kind(self, message: StoredMessage) -> str:
+    def _homework_evidence_kind(
+        self,
+        message: StoredMessage,
+        *,
+        strict: bool = False,
+    ) -> str:
         if message.message_type == "image" or "[图片]" in message.content:
             return "作业图片"
         if (
@@ -1557,11 +1593,102 @@ class GroupSummaryService:
             or _HOMEWORK_EVIDENCE_DETAIL.search(message.content)
         ):
             return "作业链接"
+        if _TEXT_ARTIFACT_FIELD.search(message.content):
+            return "文字作品正文"
+        if strict:
+            return ""
         if _HOMEWORK_EVIDENCE_DETAIL.search(message.content):
             return "完整作业正文"
         if self._is_thread_homework(message):
             return "话题作业"
         return ""
+
+    def _requires_submission_artifact(self, report_date: str) -> bool:
+        """视频周的“已完成/已提交”只是声明，必须有真实作品证据。"""
+        phase = self.settings.course_phase(report_date)
+        return bool(phase and "视频" in phase.name)
+
+    def _submission_declarations(
+        self,
+        messages: Sequence[StoredMessage],
+    ) -> List[Tuple[StoredMessage, str]]:
+        declarations: List[Tuple[StoredMessage, str]] = []
+        for message in messages:
+            message_day = datetime.fromtimestamp(
+                message.create_time_ms / 1000,
+                tz=self.settings.tz,
+            ).date()
+            allow_embedded = (
+                message.message_type == "merge_forward"
+                and not message.content.startswith(_MULTI_MERGE_PREFIX)
+            )
+            for report_date in self._submission_report_dates(
+                message.content,
+                message_day,
+                allow_embedded=allow_embedded,
+            ):
+                declarations.append((message, report_date))
+        return declarations
+
+    def _associated_artifact_messages(
+        self,
+        declaration: StoredMessage,
+        report_date: str,
+        messages: Sequence[StoredMessage],
+        declarations: Sequence[Tuple[StoredMessage, str]],
+    ) -> List[StoredMessage]:
+        """把分开发送的作品归给最近的同人作业声明，避免一份作品跨期重复计数。"""
+        artifacts: List[StoredMessage] = []
+        for candidate in messages:
+            if candidate.sender_open_id != declaration.sender_open_id:
+                continue
+            if candidate.content.startswith(_MULTI_MERGE_PREFIX):
+                continue
+            if not self._homework_evidence_kind(candidate, strict=True):
+                continue
+
+            candidate_day = datetime.fromtimestamp(
+                candidate.create_time_ms / 1000,
+                tz=self.settings.tz,
+            ).date()
+            allow_embedded = candidate.message_type == "merge_forward"
+            explicit_dates = self._submission_report_dates(
+                candidate.content,
+                candidate_day,
+                allow_embedded=allow_embedded,
+            )
+            if explicit_dates:
+                if report_date in explicit_dates:
+                    artifacts.append(candidate)
+                continue
+
+            if (
+                declaration.thread_id
+                and candidate.thread_id
+                and declaration.thread_id == candidate.thread_id
+            ):
+                artifacts.append(candidate)
+                continue
+
+            nearby = [
+                (other, other_report_date)
+                for other, other_report_date in declarations
+                if other.sender_open_id == candidate.sender_open_id
+                and abs(other.create_time_ms - candidate.create_time_ms) <= _LATE_TAG_WINDOW_MS
+            ]
+            if not nearby:
+                continue
+            nearest, nearest_report_date = min(
+                nearby,
+                key=lambda item: (
+                    abs(item[0].create_time_ms - candidate.create_time_ms),
+                    item[0].create_time_ms,
+                    item[0].message_id,
+                ),
+            )
+            if nearest.message_id == declaration.message_id and nearest_report_date == report_date:
+                artifacts.append(candidate)
+        return list({message.message_id: message for message in artifacts}.values())
 
     def _find_self_makeup_evidence(
         self,
@@ -1724,19 +1851,25 @@ class GroupSummaryService:
         homework_labels = {
             "completed": "✅ 正常打卡",
             "late": "🟡 补卡",
+            "pending": "🟠 待核验",
             "missing": "❌ 未打卡",
         }
         normal = sum(record.homework_status == "completed" for record in records)
         late = sum(record.homework_status == "late" for record in records)
+        pending = sum(record.homework_status == "pending" for record in records)
         missing = sum(record.homework_status == "missing" for record in records)
         reviewed = sum(record.review_status == "completed" for record in records)
         first_day = datetime.strptime(records[0].report_date, "%Y-%m-%d").date()
         last_day = datetime.strptime(records[-1].report_date, "%Y-%m-%d").date()
+        cumulative = f"累计：正常 {normal} 次｜补卡 {late} 次"
+        if pending:
+            cumulative += f"｜待核验 {pending} 次"
+        cumulative += f"｜未打卡 {missing} 次｜复盘 {reviewed}/{len(records)}"
         lines = [
             f"{member_name}・全部打卡记录",
             "",
             f"统计范围：{first_day.month}月{first_day.day}日—{last_day.month}月{last_day.day}日",
-            f"累计：正常 {normal} 次｜补卡 {late} 次｜未打卡 {missing} 次｜复盘 {reviewed}/{len(records)}",
+            cumulative,
             "",
             "📋 逐次记录",
             "",
@@ -2010,6 +2143,10 @@ class GroupSummaryService:
         review_evidence: Dict[str, List[str]] = defaultdict(list)
         marker_labels: Counter[str] = Counter()
         marker_evidence: Dict[str, Dict[str, List[str]]] = defaultdict(lambda: defaultdict(list))
+        marker_declarations: List[Tuple[StoredMessage, str]] = []
+        pending_evidence: Dict[str, List[str]] = defaultdict(list)
+        strict_artifact_required = self._requires_submission_artifact(report_date)
+        all_declarations = self._submission_declarations(homework_source_messages)
         thread_homework = [
             message for message in homework_source_messages if self._is_thread_homework(message)
         ]
@@ -2034,13 +2171,31 @@ class GroupSummaryService:
                 if allow_embedded or self._is_submission_marker(message.content, position):
                     marker_labels[label] += 1
                     marker_evidence[message.sender_name][label].append(message.message_id)
+                    marker_declarations.append((message, label))
 
         homework_evidence: Dict[str, List[str]] = defaultdict(list)
         if marker_labels:
             assignment_label = marker_labels.most_common(1)[0][0]
             homework_source = "tag+thread" if thread_homework else "tag"
-            for name, labels in marker_evidence.items():
-                homework_evidence[name].extend(labels.get(assignment_label, []))
+            if strict_artifact_required:
+                for declaration, label in marker_declarations:
+                    if label != assignment_label:
+                        continue
+                    artifacts = self._associated_artifact_messages(
+                        declaration,
+                        report_date,
+                        homework_source_messages,
+                        all_declarations,
+                    )
+                    if artifacts:
+                        evidence_ids = [declaration.message_id]
+                        evidence_ids.extend(message.message_id for message in artifacts)
+                        homework_evidence[declaration.sender_name].extend(evidence_ids)
+                    else:
+                        pending_evidence[declaration.sender_name].append(declaration.message_id)
+            else:
+                for name, labels in marker_evidence.items():
+                    homework_evidence[name].extend(labels.get(assignment_label, []))
             for message in thread_homework:
                 homework_evidence[message.sender_name].append(message.message_id)
         elif thread_homework:
@@ -2105,12 +2260,19 @@ class GroupSummaryService:
         homework_members_set = {
             name for name, evidence in homework_evidence.items() if evidence and name in roster_set
         }
+        pending_members_set = {
+            name
+            for name, evidence in pending_evidence.items()
+            if evidence and name in roster_set and name not in homework_members_set
+        }
         review_members_set = {
             name for name, evidence in review_evidence.items() if evidence and name in roster_set
         }
+        for name, evidence_ids in homework_evidence.items():
+            homework_evidence[name] = list(dict.fromkeys(evidence_ids))
         homework_members = [name for name in roster if name in homework_members_set]
         review_members = [name for name in roster if name in review_members_set]
-        return {
+        facts = {
             "roster": roster,
             "assignment_label": assignment_label,
             "homework_source": homework_source,
@@ -2120,9 +2282,11 @@ class GroupSummaryService:
             "image_count": image_count,
             "homework_members": homework_members,
             "late_members": [],
+            "pending_members": [name for name in roster if name in pending_members_set],
             "review_members": review_members,
             "review_counts": review_counts,
             "homework_evidence": homework_evidence,
+            "pending_evidence": pending_evidence,
             "review_evidence": review_evidence,
             "both": [
                 name
@@ -2139,12 +2303,30 @@ class GroupSummaryService:
                 for name in roster
                 if name not in homework_members_set and name in review_members_set
             ],
-            "none": [
-                name
-                for name in roster
-                if name not in homework_members_set and name not in review_members_set
-            ],
+            "none": [],
         }
+        self._rebuild_completion_groups(facts)
+        return facts
+
+    @staticmethod
+    def _rebuild_completion_groups(facts: Dict[str, Any]) -> None:
+        roster = list(facts["roster"])
+        completed = set(facts["homework_members"])
+        pending = set(facts.get("pending_members", ())) - completed
+        reviews = set(facts["review_members"])
+        facts["pending_members"] = [name for name in roster if name in pending]
+        facts["both"] = [name for name in roster if name in completed and name in reviews]
+        facts["only_homework"] = [
+            name for name in roster if name in completed and name not in reviews
+        ]
+        facts["only_reviews"] = [
+            name for name in roster if name not in completed and name in reviews
+        ]
+        facts["none"] = [
+            name
+            for name in roster
+            if name not in completed and name not in reviews and name not in pending
+        ]
 
     def _apply_late_completions(
         self, report_date: str, messages: Sequence[StoredMessage], facts: Dict[str, Any]
@@ -2164,6 +2346,7 @@ class GroupSummaryService:
         later_messages = self.store.list_messages(
             messages[0].chat_id, start_ms, end_ms, self.settings.max_messages
         )
+        later_messages = self._apply_member_aliases(later_messages)
         roster = facts["roster"]
         roster_set = set(roster)
         completed = set(facts["homework_members"])
@@ -2171,6 +2354,77 @@ class GroupSummaryService:
         late_labels: Counter[str] = Counter()
         expected_label = facts["assignment_label"]
         expected_thread_ids = {message.thread_id for message in messages if message.thread_id}
+        if self._requires_submission_artifact(report_date):
+            cycle_start, _, _ = self.settings.assignment_cycle(report_date)
+            publish_hour, publish_minute = self.settings.assignment_publish_clock(report_date)
+            submission_window_start = datetime.combine(
+                cycle_start,
+                time(publish_hour, publish_minute),
+                tzinfo=self.settings.tz,
+            )
+            combined_messages = self.store.list_messages(
+                messages[0].chat_id,
+                int(submission_window_start.timestamp() * 1000),
+                end_ms,
+                self.settings.max_messages,
+            )
+            combined_messages = self._apply_member_aliases(combined_messages)
+            declarations = self._submission_declarations(combined_messages)
+            pending = set(facts.get("pending_members", ())) if now <= late_stage_end else set()
+            pending_evidence = facts.setdefault("pending_evidence", defaultdict(list))
+            deadline_ms = int(self.settings.assignment_deadline(report_date).timestamp() * 1000)
+            for declaration, declaration_report_date in declarations:
+                if declaration_report_date != report_date:
+                    continue
+                name = self.settings.member_aliases.get(
+                    declaration.sender_open_id,
+                    declaration.sender_name,
+                )
+                if name not in roster_set:
+                    continue
+                artifacts = self._associated_artifact_messages(
+                    declaration,
+                    report_date,
+                    combined_messages,
+                    declarations,
+                )
+                if not artifacts:
+                    if now <= late_stage_end:
+                        pending.add(name)
+                        pending_evidence[name].append(declaration.message_id)
+                    continue
+                evidence_ids = [declaration.message_id]
+                evidence_ids.extend(message.message_id for message in artifacts)
+                facts["homework_evidence"][name].extend(evidence_ids)
+                completed.add(name)
+                pending.discard(name)
+                evidence_time_ms = min(message.create_time_ms for message in artifacts)
+                if evidence_time_ms > deadline_ms:
+                    late_members.add(name)
+
+            for raw_message in later_messages:
+                if raw_message.thread_id in expected_thread_ids and self._is_thread_homework(
+                    raw_message
+                ):
+                    name = self.settings.member_aliases.get(
+                        raw_message.sender_open_id,
+                        raw_message.sender_name,
+                    )
+                    if name in roster_set:
+                        facts["homework_evidence"][name].append(raw_message.message_id)
+                        completed.add(name)
+                        pending.discard(name)
+                        late_members.add(name)
+
+            facts["homework_members"] = [name for name in roster if name in completed]
+            facts["late_members"] = [name for name in roster if name in late_members]
+            facts["pending_members"] = [
+                name for name in roster if name in pending and name not in completed
+            ]
+            for name, evidence_ids in facts["homework_evidence"].items():
+                facts["homework_evidence"][name] = list(dict.fromkeys(evidence_ids))
+            self._rebuild_completion_groups(facts)
+            return
         for raw_message in later_messages:
             if raw_message.sender_open_id in self.settings.excluded_member_ids:
                 continue
@@ -2279,6 +2533,7 @@ class GroupSummaryService:
         roster_set = set(roster)
         completed = set(facts["homework_members"])
         late = set(facts["late_members"])
+        pending = set(facts.get("pending_members", ()))
         normal = completed - late
         for verification in verifications:
             name = self.settings.member_aliases.get(
@@ -2295,23 +2550,18 @@ class GroupSummaryService:
                 completed.add(name)
                 normal.add(name)
                 late.discard(name)
+                pending.discard(name)
             elif name not in normal:
                 completed.add(name)
                 late.add(name)
+                pending.discard(name)
 
-        review_members = set(facts["review_members"])
         facts["homework_members"] = [name for name in roster if name in completed]
         facts["late_members"] = [name for name in roster if name in late]
-        facts["both"] = [name for name in roster if name in completed and name in review_members]
-        facts["only_homework"] = [
-            name for name in roster if name in completed and name not in review_members
+        facts["pending_members"] = [
+            name for name in roster if name in pending and name not in completed
         ]
-        facts["only_reviews"] = [
-            name for name in roster if name not in completed and name in review_members
-        ]
-        facts["none"] = [
-            name for name in roster if name not in completed and name not in review_members
-        ]
+        self._rebuild_completion_groups(facts)
 
     @staticmethod
     def _base_cell_text(value: Any) -> str:
@@ -2359,6 +2609,7 @@ class GroupSummaryService:
         overrides = self._manual_attendance_overrides(report_date)
         completed = set(facts["homework_members"])
         late = set(facts["late_members"])
+        pending = set(facts.get("pending_members", ()))
         excluded: set[str] = set()
         for name, status in overrides.items():
             if name not in full_roster:
@@ -2367,20 +2618,26 @@ class GroupSummaryService:
                 excluded.add(name)
                 completed.discard(name)
                 late.discard(name)
+                pending.discard(name)
             elif status == "completed":
                 completed.add(name)
                 late.discard(name)
+                pending.discard(name)
             elif status == "late":
                 completed.add(name)
                 late.add(name)
+                pending.discard(name)
             elif status == "missing":
                 completed.discard(name)
                 late.discard(name)
+                pending.discard(name)
 
         facts["manual_statuses"] = overrides
         facts["excluded_members"] = [name for name in full_roster if name in excluded]
         facts["homework_members"] = [name for name in full_roster if name in completed]
         facts["late_members"] = [name for name in full_roster if name in late]
+        facts["pending_members"] = [name for name in full_roster if name in pending]
+        self._rebuild_completion_groups(facts)
         return full_roster
 
     @staticmethod
@@ -2392,19 +2649,14 @@ class GroupSummaryService:
         roster = [name for name in facts["roster"] if name not in excluded]
         completed = set(facts["homework_members"]) - excluded
         late = set(facts["late_members"]) - excluded
+        pending = set(facts.get("pending_members", ())) - excluded
         reviews = set(facts["review_members"]) - excluded
         facts["roster"] = roster
         facts["homework_members"] = [name for name in roster if name in completed]
         facts["late_members"] = [name for name in roster if name in late]
+        facts["pending_members"] = [name for name in roster if name in pending]
         facts["review_members"] = [name for name in roster if name in reviews]
-        facts["both"] = [name for name in roster if name in completed and name in reviews]
-        facts["only_homework"] = [
-            name for name in roster if name in completed and name not in reviews
-        ]
-        facts["only_reviews"] = [
-            name for name in roster if name not in completed and name in reviews
-        ]
-        facts["none"] = [name for name in roster if name not in completed and name not in reviews]
+        GroupSummaryService._rebuild_completion_groups(facts)
 
     def _persist_attendance(
         self, report_date: str, messages: Sequence[StoredMessage], facts: Dict[str, Any]
@@ -2419,6 +2671,7 @@ class GroupSummaryService:
         )
         homework_members = set(facts["homework_members"])
         late_members = set(facts["late_members"])
+        pending_members = set(facts.get("pending_members", ()))
         review_members = set(facts["review_members"])
         excluded_members = set(facts.get("excluded_members", ()))
         records = []
@@ -2438,6 +2691,8 @@ class GroupSummaryService:
                         if name in late_members
                         else "completed"
                         if name in homework_members
+                        else "pending"
+                        if name in pending_members
                         else "missing"
                     ),
                     review_status="completed" if name in review_members else "missing",
@@ -2520,6 +2775,7 @@ class GroupSummaryService:
         status_value = {
             "completed": "已提交",
             "late": "补卡",
+            "pending": "待核验",
             "missing": "未提交",
         }.get(record.homework_status)
         if status_value:
@@ -2801,9 +3057,13 @@ class GroupSummaryService:
         only_homework = facts["only_homework"]
         only_reviews = facts["only_reviews"]
         none = facts["none"]
+        pending = list(facts.get("pending_members", ()))
+        pending_set = set(pending)
         missing_review = [name for name in facts["roster"] if name not in facts["review_members"]]
         missing_homework = [
-            name for name in facts["roster"] if name not in facts["homework_members"]
+            name
+            for name in facts["roster"]
+            if name not in facts["homework_members"] and name not in pending_set
         ]
         cutoff = (
             generated_at
@@ -2856,6 +3116,17 @@ class GroupSummaryService:
             f"两项均未完成（{len(none)} 人）：",
             self._names(none),
         ]
+        if pending:
+            overview_index = lines.index(
+                f"完成{assignment_label}：{len(facts['homework_members'])}/{total}"
+            )
+            lines.insert(overview_index + 1, f"待核验：{len(pending)}/{total}")
+            completion_index = lines.index(f"复盘作业（{len(facts['review_members'])}/{total}）")
+            lines[completion_index + 1 : completion_index + 1] = [
+                "",
+                f"待核验（{len(pending)} 人）：",
+                self._names(pending),
+            ]
         if not only_reviews:
             lines.extend(["", f"说明：今日无“仅缺{assignment_short}但已交复盘”的人员。"])
         lines.extend(
@@ -2882,7 +3153,8 @@ class GroupSummaryService:
             "👋 我会在本群记录作业、复盘和提交时间，并同步到本群独立的打卡表。",
             "",
             "✅ 怎么交作业",
-            "• 发图片、文件、成果链接或完整作业正文；建议写清“#日期 第N次作业已完成”。",
+            "• “已完成 / 已提交 / 作业提交”都可作为声明；请同时或 10 分钟内发图片、视频、文件、成果链接或完整作品正文。",
+            "• 只有声明没有作品时先记为“待核验”；补上证据后自动改为正常提交或补卡。",
             "• 复盘请带 #复盘；想要文字点评可再加 #求反馈。",
             "• 补交按作业证据的真实发送时间判定；只说“我补交了”不会直接改状态。",
             "• 图片会记录为作业证据，但不识别图片内容。",
@@ -3013,13 +3285,38 @@ class GroupSummaryService:
                     and not stored.content.startswith(_MULTI_MERGE_PREFIX)
                 ),
             )
+            has_artifact = bool(self._homework_evidence_kind(stored, strict=True))
+            attachment_trigger = (
+                stored.message_type in _THREAD_HOMEWORK_TYPES
+                or bool(_RESOURCE_TOKEN.search(stored.content))
+                or self._is_thread_homework(stored)
+            )
+            if report_dates or has_artifact:
+                nearby_messages = self.store.list_messages(
+                    stored.chat_id,
+                    stored.create_time_ms - _LATE_TAG_WINDOW_MS,
+                    stored.create_time_ms + _LATE_TAG_WINDOW_MS + 1,
+                    self.settings.max_messages,
+                )
+                nearby_messages = self._apply_member_aliases(
+                    [
+                        candidate
+                        for candidate in nearby_messages
+                        if candidate.sender_open_id == stored.sender_open_id
+                    ]
+                )
+                report_dates = sorted(
+                    set(report_dates)
+                    | {
+                        nearby_report_date
+                        for _declaration, nearby_report_date in self._submission_declarations(
+                            nearby_messages
+                        )
+                    }
+                )
             if (
                 not report_dates
-                and (
-                    stored.message_type in _THREAD_HOMEWORK_TYPES
-                    or bool(_RESOURCE_TOKEN.search(stored.content))
-                    or self._is_thread_homework(stored)
-                )
+                and attachment_trigger
                 and not stored.content.startswith(_MULTI_MERGE_PREFIX)
                 and (
                     not self.settings.configured_course_phases
@@ -3337,9 +3634,15 @@ class GroupSummaryService:
         )
         completed = list(facts["homework_members"])
         late = list(facts["late_members"])
+        pending = list(facts.get("pending_members", ()))
         normal = [name for name in completed if name not in set(late)]
         total = len(facts["roster"])
-        missing_count = total - len(completed)
+        missing_count = total - len(completed) - len(pending)
+        completion_detail = (
+            f"正常 {len(normal)}，补卡 {len(late)}，待核验 {len(pending)}，未交 {missing_count}"
+            if pending
+            else f"正常 {len(normal)}，补卡 {len(late)}，未交 {missing_count}"
+        )
         lines = [
             self.settings.report_title,
             "",
@@ -3353,10 +3656,7 @@ class GroupSummaryService:
             "📊 今日打卡",
             "",
             f"应统计：{total} 人",
-            (
-                f"作业完成：{len(completed)}/{total}"
-                f"（正常 {len(normal)}，补卡 {len(late)}，未交 {missing_count}）"
-            ),
+            f"作业完成：{len(completed)}/{total}（{completion_detail}）",
             f"当日复盘：{len(facts['review_members'])}/{total}",
             f"群内消息：{len(messages)} 条（含图片 {facts['image_count']} 张）",
         ]
@@ -3431,8 +3731,14 @@ class GroupSummaryService:
             return ""
         self._persist_attendance(report_date, homework_messages or messages, facts)
         homework_completed = set(facts["homework_members"])
-        homework_missing = [name for name in facts["roster"] if name not in homework_completed]
-        union_missing = list(homework_missing)
+        pending = list(facts.get("pending_members", ()))
+        pending_set = set(pending)
+        homework_missing = [
+            name
+            for name in facts["roster"]
+            if name not in homework_completed and name not in pending_set
+        ]
+        union_missing = list(homework_missing) + pending
         open_id_by_name = {name: open_id for open_id, name in self.settings.member_aliases.items()}
         open_id_by_name.update(
             {message.sender_name: message.sender_open_id for message in messages}
@@ -3448,6 +3754,7 @@ class GroupSummaryService:
             homework_missing,
             [],
             f"attendance-reminder-{report_date}-{chat_id}"[:50],
+            pending_members=pending,
         )
         self.store.mark_reminder_sent(report_date, chat_id, message_id)
         return message_id
@@ -3489,19 +3796,33 @@ class GroupSummaryService:
             return ""
         self._persist_attendance(report_date, homework_messages or messages, facts)
         completed = set(facts["homework_members"])
-        missing = [name for name in facts["roster"] if name not in completed]
-        text = "\n".join(
+        pending = list(facts.get("pending_members", ()))
+        pending_set = set(pending)
+        missing = [
+            name for name in facts["roster"] if name not in completed and name not in pending_set
+        ]
+        lines = [
+            (
+                f"{self.settings.missing_list_hour:02d}:"
+                f"{self.settings.missing_list_minute:02d} 未交作业名单"
+            ),
+            "",
+            f"{facts['assignment_label']}已完成 {len(completed)}/{len(facts['roster'])}",
+        ]
+        if pending:
+            lines.extend(
+                [
+                    f"待核验（{len(pending)}人）：",
+                    self._names(pending),
+                ]
+            )
+        lines.extend(
             [
-                (
-                    f"{self.settings.missing_list_hour:02d}:"
-                    f"{self.settings.missing_list_minute:02d} 未交作业名单"
-                ),
-                "",
-                f"{facts['assignment_label']}已完成 {len(completed)}/{len(facts['roster'])}",
                 f"未完成（{len(missing)}人）：",
                 self._names(missing),
             ]
         )
+        text = "\n".join(lines)
         message_id = self.api.send_post(
             chat_id,
             text,
@@ -3547,19 +3868,36 @@ class GroupSummaryService:
         self._persist_attendance(report_date, homework_messages or messages, facts)
         completed = list(facts["homework_members"])
         completed_set = set(completed)
-        missing = [name for name in facts["roster"] if name not in completed_set]
-        text = "\n".join(
+        pending = list(facts.get("pending_members", ()))
+        pending_set = set(pending)
+        missing = [
+            name
+            for name in facts["roster"]
+            if name not in completed_set and name not in pending_set
+        ]
+        lines = [
+            f"{self._assignment_period_label(report_date)}・打卡汇总",
+            "",
+            f"{facts['assignment_label']}已完成 {len(completed)}/{len(facts['roster'])}",
+            f"已完成（{len(completed)}人）：",
+            self._names(completed),
+            "",
+        ]
+        if pending:
+            lines.extend(
+                [
+                    f"待核验（{len(pending)}人）：",
+                    self._names(pending),
+                    "",
+                ]
+            )
+        lines.extend(
             [
-                f"{self._assignment_period_label(report_date)}・打卡汇总",
-                "",
-                f"{facts['assignment_label']}已完成 {len(completed)}/{len(facts['roster'])}",
-                f"已完成（{len(completed)}人）：",
-                self._names(completed),
-                "",
                 f"未完成（{len(missing)}人）：",
                 self._names(missing),
             ]
         )
+        text = "\n".join(lines)
         message_id = self.api.send_post(
             chat_id,
             text,
@@ -3613,11 +3951,17 @@ class GroupSummaryService:
             logger.info("当期未识别到作业，不发送补交提醒：%s %s", report_date, chat_id)
             return ""
         completed = set(facts["homework_members"])
-        missing = [name for name in facts["roster"] if name not in completed]
-        if not missing:
+        pending = list(facts.get("pending_members", ()))
+        pending_set = set(pending)
+        missing = [
+            name for name in facts["roster"] if name not in completed and name not in pending_set
+        ]
+        if not missing and not pending:
             return ""
         open_id_by_name = {name: open_id for open_id, name in self.settings.member_aliases.items()}
-        mentions = [(open_id_by_name[name], name) for name in missing if open_id_by_name.get(name)]
+        mentions = [
+            (open_id_by_name[name], name) for name in missing + pending if open_id_by_name.get(name)
+        ]
         if not mentions:
             return ""
         message_id = self.api.send_makeup_reminder(
@@ -3625,6 +3969,7 @@ class GroupSummaryService:
             mentions,
             missing,
             f"makeup-reminder-{report_date}-{chat_id}"[:50],
+            pending_members=pending,
         )
         self.store.mark_makeup_reminder_sent(report_date, chat_id, message_id)
         return message_id
@@ -3662,26 +4007,49 @@ class GroupSummaryService:
         completed = list(facts["homework_members"])
         completed_set = set(completed)
         normal = [name for name in completed if name not in late_set]
-        missing = [name for name in facts["roster"] if name not in completed_set]
+        pending = list(facts.get("pending_members", ()))
+        pending_set = set(pending)
+        missing = [
+            name
+            for name in facts["roster"]
+            if name not in completed_set and name not in pending_set
+        ]
         total = len(facts["roster"])
-        text = "\n".join(
+        lines = [
+            f"{self._assignment_period_label(report_date)}・补交汇总",
+            "",
+            f"正常提交：{len(normal)}/{total}",
+            f"已补交：{len(late)}/{total}",
+        ]
+        if pending:
+            lines.append(f"待核验：{len(pending)}/{total}")
+        lines.extend(
             [
-                f"{self._assignment_period_label(report_date)}・补交汇总",
-                "",
-                f"正常提交：{len(normal)}/{total}",
-                f"已补交：{len(late)}/{total}",
                 f"最终完成：{len(completed)}/{total}",
                 f"仍未交：{len(missing)}/{total}",
                 "",
                 f"已补交（{len(late)}人）：",
                 self._names(late),
                 "",
+            ]
+        )
+        if pending:
+            lines.extend(
+                [
+                    f"待核验（{len(pending)}人）：",
+                    self._names(pending),
+                    "",
+                ]
+            )
+        lines.extend(
+            [
                 f"仍未交（{len(missing)}人）：",
                 self._names(missing),
                 "",
                 "说明：补交阶段已结束，此时仍未交者记为旷卡。",
             ]
         )
+        text = "\n".join(lines)
         message_id = self.api.send_post(
             chat_id,
             text,

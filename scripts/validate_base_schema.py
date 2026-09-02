@@ -118,6 +118,12 @@ def validate_schema(schema: Dict[str, Any]) -> List[str]:
     if manual.get("managed_by") != "leader" or manual_options != expected_manual:
         errors.append("人工状态必须由组长维护并包含四个标准选项")
 
+    system = fields_by_name.get("作业状态", {})
+    system_options = {str(option.get("name", "")) for option in system.get("options", [])}
+    expected_system = {"已提交", "补卡", "待核验", "未提交"}
+    if system.get("managed_by") != "bot" or system_options != expected_system:
+        errors.append("作业状态必须由机器人维护并包含四个标准选项")
+
     views = schema.get("views")
     if not isinstance(views, list):
         errors.append("缺少 views 数组")
@@ -175,6 +181,11 @@ def validate_schema(schema: Dict[str, Any]) -> List[str]:
         unknown_visible = set(visible_fields) - known_fields
         if unknown_visible:
             errors.append(f"视图 {view_name} 展示未定义字段：{sorted(unknown_visible)}")
+
+    pending_view = next((view for view in views if view.get("name") == "本周期待提交"), {})
+    pending_conditions = pending_view.get("filter", {}).get("conditions", [])
+    if ["作业状态", "intersects", ["待核验", "未提交"]] not in pending_conditions:
+        errors.append("本周期待提交视图必须同时包含待核验和未提交")
 
     override = schema.get("manual_override", {})
     if override.get("field") != "人工状态":

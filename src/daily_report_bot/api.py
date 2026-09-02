@@ -169,22 +169,41 @@ class FeishuApi:
         homework_missing: Sequence[str],
         review_missing: Sequence[str],
         uuid: str,
+        *,
+        pending_members: Sequence[str] = (),
     ) -> str:
         mention_nodes: List[Dict[str, Any]] = []
         for index, (open_id, name) in enumerate(members):
             if index:
                 mention_nodes.append({"tag": "text", "text": "、"})
             mention_nodes.append({"tag": "at", "user_id": open_id, "user_name": name})
-        content = [
-            mention_nodes or [{"tag": "text", "text": "无"}],
+        content = [mention_nodes or [{"tag": "text", "text": "无"}]]
+        if pending_members:
+            content.append(
+                [
+                    {
+                        "tag": "text",
+                        "text": (
+                            f"已声明但待补作品证据（{len(pending_members)}人）："
+                            f"{'、'.join(pending_members)}"
+                        ),
+                    }
+                ]
+            )
+        content.extend(
             [
-                {
-                    "tag": "text",
-                    "text": f"作业未交（{len(homework_missing)}人）：{'、'.join(homework_missing) or '无'}",
-                }
-            ],
-            [{"tag": "text", "text": "正常提交已截止，请在补交截止前完成打卡。"}],
-        ]
+                [
+                    {
+                        "tag": "text",
+                        "text": (
+                            f"作业未交（{len(homework_missing)}人）："
+                            f"{'、'.join(homework_missing) or '无'}"
+                        ),
+                    }
+                ],
+                [{"tag": "text", "text": "正常提交已截止，请在补交截止前完成打卡。"}],
+            ]
+        )
         payload = self._json_request(
             "POST",
             "/im/v1/messages",
@@ -208,22 +227,41 @@ class FeishuApi:
         members: Sequence[Tuple[str, str]],
         homework_missing: Sequence[str],
         uuid: str,
+        *,
+        pending_members: Sequence[str] = (),
     ) -> str:
         mention_nodes: List[Dict[str, Any]] = []
         for index, (open_id, name) in enumerate(members):
             if index:
                 mention_nodes.append({"tag": "text", "text": "、"})
             mention_nodes.append({"tag": "at", "user_id": open_id, "user_name": name})
-        content = [
-            mention_nodes or [{"tag": "text", "text": "无"}],
+        content = [mention_nodes or [{"tag": "text", "text": "无"}]]
+        if pending_members:
+            content.append(
+                [
+                    {
+                        "tag": "text",
+                        "text": (
+                            f"已声明但待补作品证据（{len(pending_members)}人）："
+                            f"{'、'.join(pending_members)}"
+                        ),
+                    }
+                ]
+            )
+        content.extend(
             [
-                {
-                    "tag": "text",
-                    "text": f"仍未补交（{len(homework_missing)}人）：{'、'.join(homework_missing) or '无'}",
-                }
-            ],
-            [{"tag": "text", "text": "请在本次补交截止前完成打卡。"}],
-        ]
+                [
+                    {
+                        "tag": "text",
+                        "text": (
+                            f"仍未补交（{len(homework_missing)}人）："
+                            f"{'、'.join(homework_missing) or '无'}"
+                        ),
+                    }
+                ],
+                [{"tag": "text", "text": "请在本次补交截止前完成打卡。"}],
+            ]
+        )
         payload = self._json_request(
             "POST",
             "/im/v1/messages",

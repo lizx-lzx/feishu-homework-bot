@@ -81,9 +81,10 @@
       "options": [
         {"name": "已提交", "hue": "Green", "lightness": "Light"},
         {"name": "补卡", "hue": "Orange", "lightness": "Light"},
+        {"name": "待核验", "hue": "Yellow", "lightness": "Light"},
         {"name": "未提交", "hue": "Red", "lightness": "Light"}
       ],
-      "description": "合并机器人识别与人工状态后的有效作业状态。",
+      "description": "合并机器人识别与人工状态后的有效作业状态；只有提交声明、尚未关联到作品证据时为“待核验”。",
       "managed_by": "bot"
     },
     {
@@ -195,7 +196,7 @@
     {
       "name": "本周期待提交",
       "type": "grid",
-      "filter": {"logic": "and", "conditions": [["周期状态", "intersects", ["当前周期"]], ["作业状态", "intersects", ["未提交"]], ["人工状态", "disjoint", ["不参与统计"]]]},
+      "filter": {"logic": "and", "conditions": [["周期状态", "intersects", ["当前周期"]], ["作业状态", "intersects", ["待核验", "未提交"]], ["人工状态", "disjoint", ["不参与统计"]]]},
       "sort": {"sort_config": [{"field": "组员姓名", "desc": false}]},
       "visible_fields": ["组员姓名", "人工状态", "作业状态", "复盘状态", "作业周期"]
     },
