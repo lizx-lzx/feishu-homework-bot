@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Optional
 from zoneinfo import ZoneInfo
 
-from daily_report_bot.config import CoursePhase, Settings
+from daily_report_bot.config import AssignmentRoute, CoursePhase, Settings
 from daily_report_bot.models import AttendanceRecord, IncomingMessage, StoredMessage
 from daily_report_bot.router import GroupServiceRouter
 from daily_report_bot.service import GroupSummaryService
@@ -252,6 +252,43 @@ def with_video_week(settings: Settings) -> Settings:
     )
 
 
+def with_day6_routes(settings: Settings) -> Settings:
+    return replace(
+        with_video_week(settings),
+        assignment_pause_dates=("2026-09-02",),
+        assignment_routes=(
+            AssignmentRoute(
+                name="DAY4 Coding",
+                report_date="2026-08-31",
+                label="第4次作业",
+                keywords=("小黄课程",),
+                active_from="2026-08-31",
+                active_until="2026-09-02",
+            ),
+            AssignmentRoute(
+                name="DAY5 Coding",
+                report_date="2026-09-01",
+                label="第5次作业",
+                keywords=("用故事板分镜图做代码视频",),
+                active_from="2026-09-01",
+                active_until="2026-09-02",
+            ),
+            AssignmentRoute(
+                name="DAY7 AIGC",
+                report_date="2026-09-03",
+                label="第7次作业",
+                keywords=("独立创作的第一条 AI 视频",),
+                active_from="2026-09-02",
+                active_until="2026-09-03",
+                open_at="2026-09-02T08:00:00+08:00",
+                deadline_at="2026-09-03T12:00:00+08:00",
+                makeup_deadline_at="2026-09-03T22:00:00+08:00",
+                declaration_required=True,
+            ),
+        ),
+    )
+
+
 def incoming(
     message_id: str,
     text: str,
@@ -283,6 +320,160 @@ def incoming(
         root_id=root_id or None,
         thread_id=thread_id or None,
     )
+
+
+def test_day6_course_content_routes_mislabeled_coding_submission_back_to_day5(tmp_path):
+    settings = with_day6_routes(make_settings(tmp_path))
+    api = FakeApi()
+    store = LocalStore(settings.db_path)
+    service = GroupSummaryService(settings, api, FakeSummarizer(), store)
+    submitted_at = datetime(2026, 9, 2, 21, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    service.handle_message(
+        incoming(
+            "om_day6_wrong_label",
+            "#9月2日 第6次作业已完成\n课程：用故事板分镜图做代码视频",
+            created_at=submitted_at,
+        )
+    )
+    service.handle_message(
+        incoming(
+            "om_day6_video",
+            "作品.mp4",
+            message_type="media",
+            created_at=submitted_at + timedelta(seconds=10),
+        )
+    )
+
+    day5 = {record.sender_name: record for record in store.list_daily_attendance("2026-09-01")}
+    assert day5["小李"].homework_status == "late"
+    assert day5["小李"].assignment_label == "第5次作业"
+    assert store.list_daily_attendance("2026-09-02") == []
+
+
+def test_valid_explicit_assignment_number_beats_conflicting_course_route(tmp_path):
+    settings = with_day6_routes(make_settings(tmp_path))
+    service = GroupSummaryService(
+        settings,
+        FakeApi(),
+        FakeSummarizer(),
+        LocalStore(settings.db_path),
+    )
+
+    report_dates = service._submission_report_dates(
+        "#9月1日 第5次作业已完成\n课程：小黄课程",
+        date(2026, 9, 1),
+    )
+
+    assert report_dates == ["2026-09-01"]
+
+
+def test_day5_makeup_attachment_does_not_fill_early_day7_task(tmp_path):
+    settings = with_day6_routes(make_settings(tmp_path))
+    store = LocalStore(settings.db_path)
+    service = GroupSummaryService(settings, FakeApi(), FakeSummarizer(), store)
+    submitted_at = datetime(2026, 9, 2, 19, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+    service.handle_message(
+        incoming(
+            "om_day5_makeup_claim",
+            "#9月2日 第5次作业补交\n课程：小黄课程",
+            created_at=submitted_at,
+        )
+    )
+    service.handle_message(
+        incoming(
+            "om_day5_makeup_image",
+            "作业图片",
+            message_type="image",
+            created_at=submitted_at + timedelta(seconds=5),
+        )
+    )
+
+    service.sync_attendance_date("2026-09-03", "oc_group")
+
+    day7 = {record.sender_name: record for record in store.list_daily_attendance("2026-09-03")}
+    assert day7["小李"].homework_status == "missing"
+
+
+def test_day7_aigc_video_can_be_submitted_early_in_post(tmp_path):
+    settings = with_day6_routes(make_settings(tmp_path))
+    api = FakeApi()
+    store = LocalStore(settings.db_path)
+    service = GroupSummaryService(settings, api, FakeSummarizer(), store)
+    submitted_at = datetime(2026, 9, 2, 17, 59, tzinfo=ZoneInfo("Asia/Shanghai"))
+    content = json.dumps(
+        {
+            "zh_cn": {
+                "content": [
+                    [
+                        {
+                            "tag": "text",
+                            "text": (
+                                "#9月2日 第6次作业已完成 "
+                                "课程：独立创作的第一条 AI 视频"
+                            ),
+                        }
+                    ],
+                    [{"tag": "media", "file_key": "file_video"}],
+                ]
+            }
+        },
+        ensure_ascii=False,
+    )
+    message = IncomingMessage(
+        message_id="om_day7_early",
+        chat_id="oc_group",
+        chat_type="group",
+        sender_open_id="ou_1",
+        sender_type="user",
+        message_type="post",
+        content=content,
+        create_time_ms=int(submitted_at.timestamp() * 1000),
+    )
+
+    service.handle_message(message)
+
+    day7 = {record.sender_name: record for record in store.list_daily_attendance("2026-09-03")}
+    assert day7["小李"].homework_status == "completed"
+    assert day7["小李"].assignment_label == "第7次作业"
+    assert day7["小李"].homework_message_ids == ("om_day7_early",)
+    assert store.list_daily_attendance("2026-09-02") == []
+
+
+def test_paused_assignment_day_removes_stale_attendance(tmp_path):
+    settings = with_day6_routes(make_settings(tmp_path))
+    store = LocalStore(settings.db_path)
+    store.replace_daily_attendance(
+        [
+            AttendanceRecord(
+                report_date="2026-09-02",
+                member_key="ou_1",
+                sender_open_id="ou_1",
+                sender_name="小李",
+                assignment_label="第6次作业",
+                homework_status="completed",
+                review_status="missing",
+                homework_source="tag",
+            )
+        ]
+    )
+    service = GroupSummaryService(settings, FakeApi(), FakeSummarizer(), store)
+
+    assert service.sync_attendance_date("2026-09-02", "oc_group") == 0
+    assert store.list_daily_attendance("2026-09-02") == []
+
+
+def test_day7_special_deadline_is_due_on_same_calendar_day(tmp_path):
+    settings = with_day6_routes(make_settings(tmp_path))
+
+    assert settings.assignment_window_start("2026-09-03") == datetime(
+        2026, 9, 2, 8, 0, tzinfo=ZoneInfo("Asia/Shanghai")
+    )
+    assert settings.assignment_due_report_date("2026-09-03") == "2026-09-03"
+    assert settings.makeup_report_date("2026-09-03") == "2026-09-03"
+    assert settings.current_assignment_report_date(
+        datetime(2026, 9, 2, 23, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+    ) == "2026-09-03"
 
 
 def make_service(tmp_path, *, send_enabled: bool = True):

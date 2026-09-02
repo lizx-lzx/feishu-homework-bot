@@ -1,0 +1,61 @@
+{
+  "pause_dates": [
+    "2026-09-02"
+  ],
+  "routes": [
+    {
+      "name": "视频周 DAY3 Coding/AIGC",
+      "report_date": "2026-08-30",
+      "label": "第3次作业",
+      "keywords": [
+        "王嘉恒代码视频",
+        "上手包出第一条",
+        "AI 视频剧本与视频提示词构建"
+      ],
+      "active_from": "2026-08-28",
+      "active_until": "2026-09-02"
+    },
+    {
+      "name": "视频周 DAY4 Coding/AIGC",
+      "report_date": "2026-08-31",
+      "label": "第4次作业",
+      "keywords": [
+        "代码视频的底层逻辑与约束",
+        "纯文字动画",
+        "AI 视频基础必备创作思维"
+      ],
+      "active_from": "2026-08-29",
+      "active_until": "2026-09-02"
+    },
+    {
+      "name": "视频周 DAY5 Coding/AIGC",
+      "report_date": "2026-09-01",
+      "label": "第5次作业",
+      "keywords": [
+        "用故事板分镜图做代码视频",
+        "用分镜图优化一段",
+        "分镜头制作代码视频转场",
+        "AI 视频商单接单经验"
+      ],
+      "active_from": "2026-08-31",
+      "active_until": "2026-09-02"
+    },
+    {
+      "name": "视频周 DAY7 AIGC独立成片",
+      "report_date": "2026-09-03",
+      "label": "第7次作业",
+      "keywords": [
+        "独立创作的第一条 AI 视频",
+        "第一条独立 AI 视频",
+        "第一条AI视频",
+        "第一条独立成片"
+      ],
+      "active_from": "2026-09-02",
+      "active_until": "2026-09-03",
+      "open_at": "2026-09-02T08:00:00+08:00",
+      "deadline_at": "2026-09-03T12:00:00+08:00",
+      "makeup_deadline_at": "2026-09-03T22:00:00+08:00",
+      "declaration_required": true
+    }
+  ]
+}

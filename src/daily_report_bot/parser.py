@@ -42,6 +42,12 @@ def _walk_post(node: Any, parts: List[str]) -> None:
             parts.append(f"@{name}")
     elif tag == "img":
         parts.append("[图片]")
+    elif tag in {"media", "video"}:
+        parts.append("[视频]")
+    elif tag == "file":
+        parts.append("[文件]")
+    elif tag == "audio":
+        parts.append("[语音]")
 
     for key, value in node.items():
         if key not in {"tag", "text", "user_name", "name", "image_key"}:

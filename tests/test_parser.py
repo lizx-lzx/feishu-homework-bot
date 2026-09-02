@@ -30,6 +30,23 @@ def test_decode_post_does_not_duplicate_content_v2():
     assert decode_content("post", content).text == "第4次作业已完成 [图片]"
 
 
+def test_decode_post_keeps_embedded_video_and_file_placeholders():
+    content = json.dumps(
+        {
+            "zh_cn": {
+                "content": [
+                    [{"tag": "text", "text": "第7次作业已完成"}],
+                    [{"tag": "media", "file_key": "file_video"}],
+                    [{"tag": "file", "file_key": "file_doc"}],
+                ]
+            }
+        },
+        ensure_ascii=False,
+    )
+
+    assert decode_content("post", content).text == "第7次作业已完成 [视频] [文件]"
+
+
 def test_decode_media_as_readable_placeholder():
     assert decode_content("image", '{"image_key":"img_x"}').text == "[图片]"
     assert decode_content("audio", '{"file_key":"file_x"}').text == "[语音]"

@@ -632,13 +632,14 @@ class GroupSummaryService:
         window_start_day = cycle_start
         if not self.settings.configured_course_phases:
             window_start_day -= timedelta(days=1)
-        publish_hour, publish_minute = self.settings.assignment_publish_clock(report_date)
         due_hour, due_minute = self.settings.assignment_due_clock(report_date)
-        start = datetime.combine(
-            window_start_day,
-            time(publish_hour, publish_minute),
-            tzinfo=self.settings.tz,
-        )
+        start = self.settings.assignment_window_start(report_date)
+        if not self.settings.configured_course_phases:
+            start = datetime.combine(
+                window_start_day,
+                start.timetz().replace(tzinfo=None),
+                tzinfo=self.settings.tz,
+            )
         end = datetime.combine(
             due_day,
             time(cutoff_hour, cutoff_minute),
@@ -996,6 +997,8 @@ class GroupSummaryService:
 
     def _attendance_record_is_in_scope(self, report_date: str) -> bool:
         """保留课程阶段内记录，并兼容第一阶段开始前的旧历史数据。"""
+        if self.settings.assignment_is_paused(report_date):
+            return False
         phases = self.settings.configured_course_phases
         if not phases:
             return True
@@ -1696,12 +1699,7 @@ class GroupSummaryService:
         claim_message: StoredMessage,
     ) -> Tuple[List[StoredMessage], str]:
         cycle_start, _, _ = self.settings.assignment_cycle(report_date)
-        publish_hour, publish_minute = self.settings.assignment_publish_clock(report_date)
-        start = datetime.combine(
-            cycle_start,
-            time(publish_hour, publish_minute),
-            tzinfo=self.settings.tz,
-        )
+        start = self.settings.assignment_window_start(report_date)
         makeup_end = self.settings.makeup_deadline(report_date)
         candidates = self.store.list_messages(
             claim_message.chat_id,
@@ -1921,6 +1919,29 @@ class GroupSummaryService:
             return f"第{assignment.group('number')}次作业"
         return label or "作业"
 
+    def _assignment_routing_override(
+        self,
+        text: str,
+        reference_day: date,
+        label: str,
+    ) -> Any:
+        """明确且有效的作业序号优先；只有缓冲日/无效序号才由内容纠正。"""
+        route = self.settings.assignment_route_for_text(text, reference_day)
+        if route is None:
+            return None
+        assignment_match = _ASSIGNMENT_NUMBER.search(label)
+        if assignment_match is None:
+            return route
+        assignment_number = self._parse_assignment_number(assignment_match.group("number"))
+        target = self.settings.assignment_date_for_number(
+            assignment_number,
+            reference_day,
+            self._course_name_hint(text),
+        )
+        if target is None or self.settings.assignment_is_paused(target):
+            return route
+        return route if route.report_date == target.isoformat() else None
+
     def _completion_markers_for_day(
         self,
         text: str,
@@ -1935,9 +1956,10 @@ class GroupSummaryService:
         for marker_day, label, position, _is_late in self._dated_completion_markers(
             text, marker_reference_day
         ):
-            if self._marker_report_date(marker_day, label) != report_date:
+            route = self._assignment_routing_override(text, marker_day, label)
+            if self._marker_report_date(marker_day, label, text) != report_date:
                 continue
-            markers.append((label, position))
+            markers.append((route.label if route else label, position))
         for target_day, label, position, _is_late in self._undated_completion_markers(
             text, marker_reference_day
         ):
@@ -1964,6 +1986,17 @@ class GroupSummaryService:
             if any(start <= match.start() < end for start, end in dated_spans):
                 continue
             label = self._clean_assignment_label(match.group("label"))
+            route = self._assignment_routing_override(text, reference_day, label)
+            if route is not None:
+                markers.append(
+                    (
+                        route.report_day,
+                        route.label,
+                        match.start(),
+                        bool(_LATE_MARKER.search(match.group("status"))),
+                    )
+                )
+                continue
             assignment_match = _ASSIGNMENT_NUMBER.search(label)
             if assignment_match is None:
                 continue
@@ -1985,12 +2018,16 @@ class GroupSummaryService:
             )
         return markers
 
-    def _marker_report_date(self, marker_day: date, label: str) -> str:
+    def _marker_report_date(self, marker_day: date, label: str, text: str = "") -> str:
         """显式的「第 N 次作业」优先决定作业归属。
 
         补卡日的日期标签往往写实际提交日，不能再用该日期反推
         作业周期；没有作业序号时，仍保留原有按日期归属的规则。
         """
+        if text and (
+            route := self._assignment_routing_override(text, marker_day, label)
+        ) is not None:
+            return route.report_date
         match = _ASSIGNMENT_NUMBER.search(label)
         if match and self.settings.configured_course_phases:
             assignment_number = self._parse_assignment_number(match.group("number"))
@@ -2053,6 +2090,10 @@ class GroupSummaryService:
         ):
             if not allow_embedded and not self._is_submission_marker(text, position):
                 continue
+            route = self._assignment_routing_override(text, candidate, label)
+            if route is not None:
+                report_dates.add(route.report_date)
+                continue
             assignment_match = _ASSIGNMENT_NUMBER.search(label)
             if assignment_match:
                 assignment_number = self._parse_assignment_number(assignment_match.group("number"))
@@ -2067,7 +2108,7 @@ class GroupSummaryService:
                 candidate
             ):
                 continue
-            report_dates.add(self._marker_report_date(candidate, label))
+            report_dates.add(self._marker_report_date(candidate, label, text))
         for candidate, _label, position, _is_late in self._undated_completion_markers(
             text, reference_day
         ):
@@ -2146,6 +2187,8 @@ class GroupSummaryService:
         marker_declarations: List[Tuple[StoredMessage, str]] = []
         pending_evidence: Dict[str, List[str]] = defaultdict(list)
         strict_artifact_required = self._requires_submission_artifact(report_date)
+        report_route = self.settings.assignment_route_for_report_date(report_date)
+        declaration_required = bool(report_route and report_route.declaration_required)
         all_declarations = self._submission_declarations(homework_source_messages)
         thread_homework = [
             message for message in homework_source_messages if self._is_thread_homework(message)
@@ -2205,17 +2248,18 @@ class GroupSummaryService:
                 if self._is_thread_homework(message) or "[图片]" in message.content:
                     homework_evidence[message.sender_name].append(message.message_id)
         else:
-            assignment_label = "图片作业"
-            homework_source = "image"
-            late_image_ids = self._late_image_message_ids(homework_source_messages)
-            for message in homework_source_messages:
-                if (
-                    "[图片]" in message.content
-                    and message.message_id not in late_image_ids
-                    and not message.parent_id
-                    and not message.root_id
-                ):
-                    homework_evidence[message.sender_name].append(message.message_id)
+            assignment_label = report_route.label if declaration_required else "图片作业"
+            homework_source = "tag" if declaration_required else "image"
+            if not declaration_required:
+                late_image_ids = self._late_image_message_ids(homework_source_messages)
+                for message in homework_source_messages:
+                    if (
+                        "[图片]" in message.content
+                        and message.message_id not in late_image_ids
+                        and not message.parent_id
+                        and not message.root_id
+                    ):
+                        homework_evidence[message.sender_name].append(message.message_id)
 
         for message in homework_source_messages:
             if (
@@ -2355,13 +2399,7 @@ class GroupSummaryService:
         expected_label = facts["assignment_label"]
         expected_thread_ids = {message.thread_id for message in messages if message.thread_id}
         if self._requires_submission_artifact(report_date):
-            cycle_start, _, _ = self.settings.assignment_cycle(report_date)
-            publish_hour, publish_minute = self.settings.assignment_publish_clock(report_date)
-            submission_window_start = datetime.combine(
-                cycle_start,
-                time(publish_hour, publish_minute),
-                tzinfo=self.settings.tz,
-            )
+            submission_window_start = self.settings.assignment_window_start(report_date)
             combined_messages = self.store.list_messages(
                 messages[0].chat_id,
                 int(submission_window_start.timestamp() * 1000),
@@ -2370,12 +2408,22 @@ class GroupSummaryService:
             )
             combined_messages = self._apply_member_aliases(combined_messages)
             declarations = self._submission_declarations(combined_messages)
+            routed_labels: Counter[str] = Counter()
             pending = set(facts.get("pending_members", ())) if now <= late_stage_end else set()
             pending_evidence = facts.setdefault("pending_evidence", defaultdict(list))
             deadline_ms = int(self.settings.assignment_deadline(report_date).timestamp() * 1000)
             for declaration, declaration_report_date in declarations:
                 if declaration_report_date != report_date:
                     continue
+                declaration_day = datetime.fromtimestamp(
+                    declaration.create_time_ms / 1000,
+                    tz=self.settings.tz,
+                ).date()
+                if route := self.settings.assignment_route_for_text(
+                    declaration.content,
+                    declaration_day,
+                ):
+                    routed_labels[route.label] += 1
                 name = self.settings.member_aliases.get(
                     declaration.sender_open_id,
                     declaration.sender_name,
@@ -2418,6 +2466,9 @@ class GroupSummaryService:
 
             facts["homework_members"] = [name for name in roster if name in completed]
             facts["late_members"] = [name for name in roster if name in late_members]
+            if expected_label in {"图片作业", "话题作业"} and routed_labels:
+                facts["assignment_label"] = routed_labels.most_common(1)[0][0]
+                facts["homework_source"] = "tag"
             facts["pending_members"] = [
                 name for name in roster if name in pending and name not in completed
             ]
@@ -2743,7 +2794,7 @@ class GroupSummaryService:
         iteration = self.store.latest_iteration(record.report_date, record.member_key)
         cycle_start, _, assignment_number = self.settings.assignment_cycle(record.report_date)
         current_cycle_start = self.settings.assignment_cycle(
-            datetime.now(tz=self.settings.tz).date()
+            self.settings.current_assignment_report_date()
         )[0]
         completed, late, missing = self.store.attendance_totals(
             record.member_key, self._totals_through_date(record.report_date)
@@ -2863,15 +2914,17 @@ class GroupSummaryService:
                 self._base_record_index[record_key] = record_id
                 counts["created"] += 1
             self.store.save_base_sync_state(record_key, record_id, payload_hash)
-        current_report_date = self.settings.assignment_report_date(
-            datetime.now(tz=self.settings.tz).date()
-        )
+        current_report_date = self.settings.current_assignment_report_date()
         if records and records[0].report_date == current_report_date:
             self._refresh_base_cycle_statuses(current_report_date)
         return counts
 
     def sync_attendance_date(self, report_date: str, chat_id: str) -> int:
         if not self._attendance_record_is_in_scope(report_date):
+            if self.settings.assignment_is_paused(report_date):
+                removed = self.store.delete_attendance_date(report_date)
+                logger.info("缓冲日不建立全员作业记录：%s %s，清理 %d 条", report_date, chat_id, removed)
+                return 0
             logger.info("日期位于课程阶段空档，跳过打卡同步：%s %s", report_date, chat_id)
             return 0
         report_date = self.settings.assignment_report_date(report_date)
@@ -3691,6 +3744,9 @@ class GroupSummaryService:
             logger.info("发送已关闭，跳过定时总结")
             return []
         day = report_date or self._scheduled_report_date()
+        if self.settings.assignment_is_paused(day):
+            logger.info("当天是课程缓冲日，跳过全员日报：%s", day)
+            return []
         if self.settings.configured_course_phases and not self.settings.course_is_active(day):
             logger.info("当天不在已配置的课程阶段内，跳过定时简报：%s", day)
             return []

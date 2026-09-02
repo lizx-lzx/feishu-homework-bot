@@ -131,6 +131,116 @@ class CoursePhase:
         return day >= self.start_day and (self.end_day is None or day <= self.end_day)
 
 
+@dataclass(frozen=True)
+class AssignmentRoute:
+    """按课程内容把成员自填的错误日期/序号路由回真实任务。"""
+
+    name: str
+    report_date: str
+    label: str
+    keywords: Tuple[str, ...]
+    active_from: str = ""
+    active_until: str = ""
+    open_at: str = ""
+    deadline_at: str = ""
+    makeup_deadline_at: str = ""
+    declaration_required: bool = False
+
+    @property
+    def report_day(self) -> date:
+        return datetime.strptime(self.report_date, "%Y-%m-%d").date()
+
+    @staticmethod
+    def _normalized(value: str) -> str:
+        return "".join(value.split()).casefold()
+
+    def matches(self, text: str, reference_day: date) -> bool:
+        if self.active_from and reference_day < datetime.fromisoformat(
+            self.active_from
+        ).date():
+            return False
+        if self.active_until and reference_day > datetime.fromisoformat(
+            self.active_until
+        ).date():
+            return False
+        normalized = self._normalized(text)
+        return any(self._normalized(keyword) in normalized for keyword in self.keywords)
+
+
+def _load_assignment_schedule() -> Tuple[Tuple[AssignmentRoute, ...], Tuple[str, ...]]:
+    raw = os.getenv("ASSIGNMENT_ROUTES_JSON", "").strip()
+    source = "ASSIGNMENT_ROUTES_JSON"
+    if not raw:
+        path_value = os.getenv("ASSIGNMENT_ROUTES_PATH", "").strip()
+        if not path_value:
+            return (), ()
+        path = Path(path_value)
+        source = f"ASSIGNMENT_ROUTES_PATH={path}"
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise ConfigurationError(f"无法读取作业路由文件 {path}：{exc}") from exc
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ConfigurationError(f"{source} 不是合法 JSON：{exc}") from exc
+    if not isinstance(parsed, dict):
+        raise ConfigurationError(f"{source} 必须是包含 routes 的 JSON 对象")
+    raw_routes = parsed.get("routes", [])
+    raw_pauses = parsed.get("pause_dates", [])
+    if not isinstance(raw_routes, list) or not isinstance(raw_pauses, list):
+        raise ConfigurationError(f"{source} 的 routes 和 pause_dates 必须是数组")
+    routes = []
+    allowed = {
+        "name",
+        "report_date",
+        "label",
+        "keywords",
+        "active_from",
+        "active_until",
+        "open_at",
+        "deadline_at",
+        "makeup_deadline_at",
+        "declaration_required",
+    }
+    for index, item in enumerate(raw_routes, start=1):
+        if not isinstance(item, dict):
+            raise ConfigurationError(f"{source} 第 {index} 条路由必须是 JSON 对象")
+        unknown = set(item) - allowed
+        if unknown:
+            raise ConfigurationError(
+                f"{source} 第 {index} 条路由包含未知字段：" + ", ".join(sorted(unknown))
+            )
+        keywords = item.get("keywords")
+        if not isinstance(keywords, list) or not keywords or not all(
+            isinstance(keyword, str) and keyword.strip() for keyword in keywords
+        ):
+            raise ConfigurationError(f"{source} 第 {index} 条路由 keywords 必须是非空字符串数组")
+        if "declaration_required" in item and not isinstance(
+            item["declaration_required"], bool
+        ):
+            raise ConfigurationError(
+                f"{source} 第 {index} 条路由 declaration_required 必须是布尔值"
+            )
+        routes.append(
+            AssignmentRoute(
+                name=str(item.get("name") or "").strip(),
+                report_date=str(item.get("report_date") or "").strip(),
+                label=str(item.get("label") or "").strip(),
+                keywords=tuple(keyword.strip() for keyword in keywords),
+                active_from=str(item.get("active_from") or "").strip(),
+                active_until=str(item.get("active_until") or "").strip(),
+                open_at=str(item.get("open_at") or "").strip(),
+                deadline_at=str(item.get("deadline_at") or "").strip(),
+                makeup_deadline_at=str(item.get("makeup_deadline_at") or "").strip(),
+                declaration_required=bool(item.get("declaration_required", False)),
+            )
+        )
+    if not all(isinstance(value, str) and value.strip() for value in raw_pauses):
+        raise ConfigurationError(f"{source} 的 pause_dates 必须是非空日期字符串数组")
+    return tuple(routes), tuple(value.strip() for value in raw_pauses)
+
+
 def _load_course_phases() -> Tuple[CoursePhase, ...]:
     raw = os.getenv("COURSE_PHASES_JSON", "").strip()
     if not raw:
@@ -258,6 +368,8 @@ class Settings:
     assignment_due_minute: int = 0
     course_phases: Tuple[CoursePhase, ...] = ()
     assignment_deadline_overrides: Dict[str, str] = field(default_factory=dict)
+    assignment_routes: Tuple[AssignmentRoute, ...] = ()
+    assignment_pause_dates: Tuple[str, ...] = ()
     group_databases: Dict[str, str] = field(default_factory=dict)
     capture_only_chat_ids: Tuple[str, ...] = ()
     group_profiles: Dict[str, Dict[str, Any]] = field(default_factory=dict)
@@ -266,8 +378,69 @@ class Settings:
     def tz(self) -> ZoneInfo:
         return ZoneInfo(self.timezone)
 
+    def _route_datetime(self, value: str) -> Optional[datetime]:
+        if not value:
+            return None
+        moment = datetime.fromisoformat(value)
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=self.tz)
+        return moment.astimezone(self.tz)
+
+    def assignment_route_for_text(
+        self,
+        text: str,
+        reference_day: Union[str, date],
+    ) -> Optional[AssignmentRoute]:
+        day = (
+            reference_day
+            if isinstance(reference_day, date)
+            else datetime.strptime(reference_day, "%Y-%m-%d").date()
+        )
+        return next((route for route in self.assignment_routes if route.matches(text, day)), None)
+
+    def assignment_route_for_report_date(self, report_date: str) -> Optional[AssignmentRoute]:
+        return next(
+            (route for route in self.assignment_routes if route.report_date == report_date),
+            None,
+        )
+
+    def assignment_is_paused(self, value: Union[str, date]) -> bool:
+        day = value if isinstance(value, date) else datetime.strptime(value, "%Y-%m-%d").date()
+        return day.isoformat() in self.assignment_pause_dates
+
+    def assignment_window_start(self, report_date: str) -> datetime:
+        cycle_start, _, _ = self.assignment_cycle(report_date)
+        route = self.assignment_route_for_report_date(cycle_start.isoformat())
+        if route and (moment := self._route_datetime(route.open_at)):
+            return moment
+        publish_hour, publish_minute = self.assignment_publish_clock(cycle_start)
+        return datetime.combine(
+            cycle_start,
+            time(publish_hour, publish_minute),
+            tzinfo=self.tz,
+        )
+
+    def current_assignment_report_date(self, moment: Optional[datetime] = None) -> str:
+        current = moment or datetime.now(tz=self.tz)
+        current = current.astimezone(self.tz)
+        default = self.assignment_report_date(current.date())
+        if not self.assignment_is_paused(default):
+            return default
+        active_routes = []
+        for route in self.assignment_routes:
+            opened = self._route_datetime(route.open_at)
+            closed = self._route_datetime(route.makeup_deadline_at or route.deadline_at)
+            if opened and closed and opened <= current <= closed:
+                active_routes.append((opened, route.report_date))
+        if not active_routes:
+            return default
+        return max(active_routes, key=lambda item: item[0])[1]
+
     def assignment_deadline(self, report_date: str) -> datetime:
         cycle_start, cycle_end, _ = self.assignment_cycle(report_date)
+        route = self.assignment_route_for_report_date(cycle_start.isoformat())
+        if route and (moment := self._route_datetime(route.deadline_at)):
+            return moment
         phase = self.course_phase(cycle_start)
         due_hour = phase.due_hour if phase else self.assignment_due_hour
         due_minute = phase.due_minute if phase else self.assignment_due_minute
@@ -290,8 +463,11 @@ class Settings:
         return deadline.astimezone(self.tz)
 
     def makeup_deadline(self, report_date: str) -> datetime:
-        normal_deadline = self.assignment_deadline(report_date)
         cycle_start, _, _ = self.assignment_cycle(report_date)
+        route = self.assignment_route_for_report_date(cycle_start.isoformat())
+        if route and (moment := self._route_datetime(route.makeup_deadline_at)):
+            return moment
+        normal_deadline = self.assignment_deadline(report_date)
         phase = self.course_phase(cycle_start)
         day_offset = phase.makeup_day_offset if phase else 1
         hour = (
@@ -476,6 +652,8 @@ class Settings:
             if report_date in seen:
                 continue
             seen.add(report_date)
+            if self.assignment_is_paused(report_date):
+                continue
             deadline = (
                 self.makeup_deadline(report_date)
                 if makeup
@@ -607,6 +785,31 @@ class Settings:
                 self.assignment_deadline(report_date)
             except ValueError as exc:
                 raise ConfigurationError(f"作业日期格式不合法：{report_date}") from exc
+        for index, route in enumerate(self.assignment_routes, start=1):
+            if not route.name or not route.report_date or not route.label:
+                raise ConfigurationError(f"第 {index} 条作业路由缺少 name/report_date/label")
+            try:
+                route.report_day
+                for value in (
+                    route.active_from,
+                    route.active_until,
+                    route.open_at,
+                    route.deadline_at,
+                    route.makeup_deadline_at,
+                ):
+                    if value:
+                        datetime.fromisoformat(value)
+            except ValueError as exc:
+                raise ConfigurationError(f"第 {index} 条作业路由日期时间格式不合法") from exc
+            deadline = self._route_datetime(route.deadline_at)
+            makeup_deadline = self._route_datetime(route.makeup_deadline_at)
+            if deadline and makeup_deadline and makeup_deadline <= deadline:
+                raise ConfigurationError(f"第 {index} 条作业路由补交截止必须晚于正常截止")
+        for value in self.assignment_pause_dates:
+            try:
+                datetime.strptime(value, "%Y-%m-%d")
+            except ValueError as exc:
+                raise ConfigurationError(f"暂停作业日期格式不合法：{value}") from exc
         unknown_capture_chats = set(self.capture_only_chat_ids) - set(self.group_databases)
         if self.group_databases and unknown_capture_chats:
             raise ConfigurationError(
@@ -622,6 +825,7 @@ class Settings:
 
 def load_settings(env_file: str = ".env") -> Settings:
     load_dotenv(env_file, override=False)
+    assignment_routes, assignment_pause_dates = _load_assignment_schedule()
     return Settings(
         app_id=os.getenv("FEISHU_APP_ID", ""),
         app_secret=os.getenv("FEISHU_APP_SECRET", ""),
@@ -685,6 +889,8 @@ def load_settings(env_file: str = ".env") -> Settings:
         assignment_due_minute=int(os.getenv("ASSIGNMENT_DUE_MINUTE", "0")),
         course_phases=_load_course_phases(),
         assignment_deadline_overrides=_json_string_map("ASSIGNMENT_DEADLINE_OVERRIDES_JSON"),
+        assignment_routes=assignment_routes,
+        assignment_pause_dates=assignment_pause_dates,
         group_databases=_json_string_map("GROUP_DATABASES_JSON"),
         capture_only_chat_ids=_csv("CAPTURE_ONLY_CHAT_IDS"),
         group_profiles=_load_group_profiles(),

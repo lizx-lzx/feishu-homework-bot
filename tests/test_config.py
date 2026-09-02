@@ -95,6 +95,46 @@ def test_multiple_course_phases_are_loaded_from_dotenv(tmp_path, monkeypatch):
     assert settings.course_phases[1].end_day is None
 
 
+def test_assignment_routes_and_pause_dates_are_loaded_from_file(tmp_path, monkeypatch):
+    schedule = tmp_path / "routes.json"
+    schedule.write_text(
+        json.dumps(
+            {
+                "pause_dates": ["2026-09-02"],
+                "routes": [
+                    {
+                        "name": "DAY7 AIGC",
+                        "report_date": "2026-09-03",
+                        "label": "第7次作业",
+                        "keywords": ["第一条独立 AI 视频"],
+                        "open_at": "2026-09-02T08:00:00+08:00",
+                        "deadline_at": "2026-09-03T12:00:00+08:00",
+                        "makeup_deadline_at": "2026-09-03T22:00:00+08:00",
+                        "declaration_required": True,
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    env_file = tmp_path / ".env"
+    env_file.write_text("", encoding="utf-8")
+    monkeypatch.setenv("FEISHU_APP_ID", "cli_test")
+    monkeypatch.setenv("ASSIGNMENT_ROUTES_PATH", str(schedule))
+    monkeypatch.setenv("BASE_SYNC_ENABLED", "false")
+
+    settings = load_settings(str(env_file))
+    settings.validate(require_secrets=False)
+
+    assert settings.assignment_pause_dates == ("2026-09-02",)
+    assert settings.assignment_routes[0].label == "第7次作业"
+    assert settings.assignment_routes[0].declaration_required is True
+    assert settings.assignment_route_for_text(
+        "课程：第一条独立 AI 视频", "2026-09-02"
+    ).report_date == "2026-09-03"
+
+
 @pytest.mark.parametrize(
     "phases, error",
     [
